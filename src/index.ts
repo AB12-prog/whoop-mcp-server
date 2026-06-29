@@ -6,6 +6,7 @@ import express, { type Request, type Response } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { mountOAuthProxy } from './oauth-proxy.js';
 
 interface ToolArguments {
 	days?: number;
@@ -342,29 +343,31 @@ async function main(): Promise<void> {
 	} else {
 		const app = express();
 		app.use(express.json());
+		app.use(express.urlencoded({ extended: true }));
 
-		app.get('/callback', async (req: Request, res: Response) => {
-			const code = req.query.code as string | undefined;
-			if (!code) {
-				res.status(400).send('Missing authorization code');
-				return;
-			}
+		const baseUrl = (process.env.BASE_URL ?? '').replace(/\/+$/, '');
+		if (!baseUrl) {
+			throw new Error('BASE_URL env var is required, e.g. https://your-app.up.railway.app');
+		}
 
-			try {
+		const { requireMcpAuth } = mountOAuthProxy({
+			app,
+			dbPath: config.dbPath,
+			baseUrl,
+			whoopClientId: config.clientId,
+			whoopRedirectUri: config.redirectUri,
+			exchangeAndSaveWhoopCode: async (code: string) => {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
 				sync.syncDays(90).catch(() => {});
-				res.send('Authorization successful! You can close this window.');
-			} catch {
-				res.status(500).send('Authorization failed. Please try again.');
-			}
+			},
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		app.all('/mcp', async (req: Request, res: Response) => {
+		app.all('/mcp', requireMcpAuth, async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
