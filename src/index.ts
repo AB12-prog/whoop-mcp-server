@@ -397,7 +397,14 @@ async function main(): Promise<void> {
 					await server.connect(transport);
 				}
 
-				await transport.handleRequest(req, res, req.body);
+				try {
+					await transport.handleRequest(req, res, req.body);
+				} catch (err) {
+					console.error('[mcp] handleRequest error', err);
+					if (!res.headersSent) {
+						res.status(500).json({ error: 'internal_error' });
+					}
+				}
 				return;
 			}
 
