@@ -153,7 +153,24 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			return;
 		}
 
+		// Hardening: only Claude's own callback hosts may be registered as redirect
+		// targets, so a crafted client can't divert an authorization code elsewhere.
+		const ALLOWED_REDIRECT_HOSTS = new Set(['claude.ai', 'claude.com']);
+		const allValid = redirectUris.every(u => {
+			try {
+				return ALLOWED_REDIRECT_HOSTS.has(new URL(u).hostname);
+			} catch {
+				return false;
+			}
+		});
+		if (!allValid) {
+			console.error('[oauth] /register rejected redirect_uris', JSON.stringify(redirectUris));
+			res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri host not allowed' });
+			return;
+		}
+
 		const clientId = crypto.randomUUID();
+		console.log('[oauth] /register ok', JSON.stringify(redirectUris));
 		db.prepare('INSERT INTO oauth_clients (client_id, redirect_uris, created_at) VALUES (?, ?, ?)')
 			.run(clientId, JSON.stringify(redirectUris), Date.now());
 
@@ -204,6 +221,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			VALUES (?, ?, ?, ?, ?, ?)
 		`).run(whoopState, client_id, redirect_uri, code_challenge, state ?? null, Date.now());
 
+		console.log('[oauth] /authorize ok -> redirecting to WHOOP login');
 		const params = new URLSearchParams({
 			client_id: whoopClientId,
 			redirect_uri: whoopRedirectUri,
@@ -220,33 +238,37 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		const code = req.query.code as string | undefined;
 		const state = req.query.state as string | undefined;
 		const error = req.query.error as string | undefined;
+		console.log('[oauth] /callback hit', { hasCode: Boolean(code), hasState: Boolean(state), hasError: Boolean(error) });
 
 		if (error) {
-			res.status(400).send(`WHOOP authorization failed: ${error}`);
+			// Do NOT reflect the raw error value into the response (XSS guard).
+			console.error('[oauth] /callback WHOOP returned error:', error);
+			res.status(400).type('text/plain').send('WHOOP authorization was denied or failed.');
 			return;
 		}
-		if (!code) {
-			res.status(400).send('Missing authorization code');
+		if (!code || !state) {
+			res.status(400).type('text/plain').send('Missing authorization code or state.');
 			return;
 		}
 
+		// Validate FIRST: only act on a flow this server actually started. This blocks
+		// unsolicited callbacks from triggering a token exchange or overwriting tokens.
+		const pending = db.prepare('SELECT * FROM oauth_pending WHERE whoop_state = ?').get(state) as
+			| { client_id: string; redirect_uri: string; code_challenge: string; client_state: string | null }
+			| undefined;
+		if (!pending) {
+			console.error('[oauth] /callback rejected: unknown or expired state');
+			res.status(400).type('text/plain').send('Unknown or expired authorization request.');
+			return;
+		}
+
+		// Now it's safe to exchange the WHOOP code and persist tokens.
 		try {
 			await exchangeAndSaveWhoopCode(code);
+			console.log('[oauth] /callback WHOOP tokens saved');
 		} catch (e) {
-			res.status(500).send(`WHOOP token exchange failed: ${e instanceof Error ? e.message : 'unknown'}`);
-			return;
-		}
-
-		// Is this part of a Claude connector flow? If so, finish it.
-		const pending = state
-			? (db.prepare('SELECT * FROM oauth_pending WHERE whoop_state = ?').get(state) as
-				| { client_id: string; redirect_uri: string; code_challenge: string; client_state: string | null }
-				| undefined)
-			: undefined;
-
-		if (!pending) {
-			// Standalone get_auth_url flow: nothing more to do.
-			res.send('Authorization successful. You can close this window.');
+			console.error('[oauth] /callback WHOOP exchange FAILED', e instanceof Error ? e.message : e);
+			res.status(500).type('text/plain').send('WHOOP token exchange failed.');
 			return;
 		}
 
@@ -261,6 +283,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		const redirect = new URL(pending.redirect_uri);
 		redirect.searchParams.set('code', authCode);
 		if (pending.client_state) redirect.searchParams.set('state', pending.client_state);
+		console.log('[oauth] /callback -> redirecting to Claude', pending.redirect_uri);
 		res.redirect(redirect.toString());
 	});
 
@@ -269,10 +292,15 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 	app.post('/token', (req: Request, res: Response) => {
 		const body = (req.body ?? {}) as Record<string, string | undefined>;
 		const grantType = body.grant_type;
+		console.log('[oauth] /token grant_type=', grantType, 'keys=', Object.keys(body).join(','));
 
 		if (grantType === 'authorization_code') {
 			const { code, code_verifier, redirect_uri, client_id } = body;
 			if (!code || !code_verifier || !redirect_uri || !client_id) {
+				console.error('[oauth] /token invalid_request, missing fields', {
+					code: Boolean(code), code_verifier: Boolean(code_verifier),
+					redirect_uri: Boolean(redirect_uri), client_id: Boolean(client_id),
+				});
 				res.status(400).json({ error: 'invalid_request' });
 				return;
 			}
@@ -283,19 +311,26 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 				| undefined;
 
 			if (!row || Date.now() - row.created_at > AUTH_CODE_TTL_MS) {
+				console.error('[oauth] /token invalid_grant: code not found or expired', { found: Boolean(row) });
 				res.status(400).json({ error: 'invalid_grant', error_description: 'code invalid or expired' });
 				return;
 			}
 			if (row.client_id !== client_id || row.redirect_uri !== redirect_uri) {
+				console.error('[oauth] /token invalid_grant: client/redirect mismatch', {
+					storedClient: row.client_id, sentClient: client_id,
+					storedRedirect: row.redirect_uri, sentRedirect: redirect_uri,
+				});
 				res.status(400).json({ error: 'invalid_grant', error_description: 'client/redirect mismatch' });
 				return;
 			}
 			if (sha256base64url(code_verifier) !== row.code_challenge) {
+				console.error('[oauth] /token invalid_grant: PKCE mismatch');
 				res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
 				return;
 			}
 
 			db.prepare('DELETE FROM oauth_codes WHERE code_hash = ?').run(sha256hex(code)); // single use
+			console.log('[oauth] /token authorization_code OK, issuing tokens');
 			res.json(issueTokens(client_id));
 			return;
 		}
@@ -313,16 +348,19 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 				| undefined;
 
 			if (!row || row.client_id !== client_id || Date.now() > row.refresh_expires_at) {
+				console.error('[oauth] /token refresh invalid_grant', { found: Boolean(row) });
 				res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token invalid or expired' });
 				return;
 			}
 
 			// Rotate: invalidate the old token pair, issue a new one.
 			db.prepare('DELETE FROM oauth_tokens WHERE refresh_hash = ?').run(sha256hex(refresh_token));
+			console.log('[oauth] /token refresh OK, rotating tokens');
 			res.json(issueTokens(client_id));
 			return;
 		}
 
+		console.error('[oauth] /token unsupported_grant_type', grantType);
 		res.status(400).json({ error: 'unsupported_grant_type' });
 	});
 
@@ -360,10 +398,11 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 
 	function requireMcpAuth(req: Request, res: Response, next: NextFunction): void {
 		const header = req.headers.authorization ?? '';
-		const match = /^Bearer (.+)$/.exec(header);
+		const match = /^Bearer (.+)$/i.exec(header);
 		const challenge = `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`;
 
 		if (!match) {
+			console.log('[oauth] /mcp 401: no bearer token (expected on first connect)');
 			res.set('WWW-Authenticate', challenge).status(401).json({ error: 'unauthorized' });
 			return;
 		}
@@ -372,11 +411,13 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			.get(sha256hex(match[1])) as { access_expires_at: number } | undefined;
 
 		if (!row || Date.now() > row.access_expires_at) {
+			console.log('[oauth] /mcp 401: token not found or expired', { found: Boolean(row) });
 			// 401 prompts Claude to refresh via /token.
 			res.set('WWW-Authenticate', challenge).status(401).json({ error: 'invalid_token' });
 			return;
 		}
 
+		console.log('[oauth] /mcp authorized');
 		next();
 	}
 
