@@ -83,8 +83,18 @@ export interface WhoopSleep {
 	};
 }
 
+export interface WhoopZoneDurations {
+	zone_zero_milli: number;
+	zone_one_milli: number;
+	zone_two_milli: number;
+	zone_three_milli: number;
+	zone_four_milli: number;
+	zone_five_milli: number;
+}
+
 export interface WhoopWorkout {
 	id: string;
+	v1_id?: number;
 	user_id: number;
 	created_at: string;
 	updated_at: string;
@@ -92,6 +102,7 @@ export interface WhoopWorkout {
 	end: string;
 	timezone_offset: string;
 	sport_id: number;
+	sport_name?: string;
 	score_state: 'SCORED' | 'PENDING_SCORE' | 'UNSCORABLE';
 	score?: {
 		strain: number;
@@ -99,14 +110,12 @@ export interface WhoopWorkout {
 		max_heart_rate: number;
 		kilojoule: number;
 		percent_recorded: number;
-		zone_duration: {
-			zone_zero_milli: number;
-			zone_one_milli: number;
-			zone_two_milli: number;
-			zone_three_milli: number;
-			zone_four_milli: number;
-			zone_five_milli: number;
-		};
+		distance_meter?: number;
+		altitude_gain_meter?: number;
+		altitude_change_meter?: number;
+		// v2 uses the plural key; keep the singular as a fallback for safety.
+		zone_durations?: WhoopZoneDurations;
+		zone_duration?: WhoopZoneDurations;
 	};
 }
 
@@ -120,6 +129,7 @@ export interface DbCycle {
 	user_id: number;
 	start_time: string;
 	end_time: string | null;
+	timezone_offset: string | null;
 	score_state: string;
 	strain: number | null;
 	kilojoule: number | null;
@@ -133,7 +143,9 @@ export interface DbRecovery {
 	user_id: number;
 	sleep_id: string;
 	created_at: string;
+	updated_at: string | null;
 	score_state: string;
+	user_calibrating: number | null;
 	recovery_score: number | null;
 	resting_hr: number | null;
 	hrv_rmssd: number | null;
@@ -146,15 +158,21 @@ export interface DbSleep {
 	id: string;
 	user_id: number;
 	cycle_id: number | null;
+	created_at: string | null;
+	updated_at: string | null;
+	timezone_offset: string | null;
 	start_time: string;
 	end_time: string;
 	is_nap: number;
 	score_state: string;
 	total_in_bed_milli: number | null;
 	total_awake_milli: number | null;
+	total_no_data_milli: number | null;
 	total_light_milli: number | null;
 	total_deep_milli: number | null;
 	total_rem_milli: number | null;
+	sleep_cycle_count: number | null;
+	disturbance_count: number | null;
 	sleep_performance: number | null;
 	sleep_efficiency: number | null;
 	sleep_consistency: number | null;
@@ -162,13 +180,19 @@ export interface DbSleep {
 	sleep_needed_baseline_milli: number | null;
 	sleep_needed_debt_milli: number | null;
 	sleep_needed_strain_milli: number | null;
+	sleep_needed_nap_milli: number | null;
 	synced_at: string;
 }
 
 export interface DbWorkout {
 	id: string;
+	v1_id: number | null;
 	user_id: number;
 	sport_id: number;
+	sport_name: string | null;
+	created_at: string | null;
+	updated_at: string | null;
+	timezone_offset: string | null;
 	start_time: string;
 	end_time: string;
 	score_state: string;
@@ -176,11 +200,30 @@ export interface DbWorkout {
 	avg_hr: number | null;
 	max_hr: number | null;
 	kilojoule: number | null;
+	percent_recorded: number | null;
+	distance_meter: number | null;
+	altitude_gain_meter: number | null;
+	altitude_change_meter: number | null;
 	zone_zero_milli: number | null;
 	zone_one_milli: number | null;
 	zone_two_milli: number | null;
 	zone_three_milli: number | null;
 	zone_four_milli: number | null;
 	zone_five_milli: number | null;
+	synced_at: string;
+}
+
+export interface DbProfile {
+	user_id: number;
+	email: string | null;
+	first_name: string | null;
+	last_name: string | null;
+	synced_at: string;
+}
+
+export interface DbBodyMeasurement {
+	height_meter: number | null;
+	weight_kilogram: number | null;
+	max_heart_rate: number | null;
 	synced_at: string;
 }
