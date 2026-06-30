@@ -84,7 +84,7 @@ function validateDays(value: unknown): number {
 	if (value === undefined || value === null) return 14;
 	const num = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
 	if (Number.isNaN(num) || num < 1) return 14;
-	return Math.min(num, 90);
+	return Math.min(num, 3650);
 }
 
 function validateBoolean(value: unknown): boolean {
@@ -111,7 +111,7 @@ function createMcpServer(): Server {
 				description: 'Get recovery score trends over time, including HRV and resting heart rate patterns.',
 				inputSchema: {
 					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
+					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
 					required: [],
 				},
 			},
@@ -120,7 +120,7 @@ function createMcpServer(): Server {
 				description: 'Get detailed sleep analysis including duration, stages, efficiency, and sleep debt.',
 				inputSchema: {
 					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
+					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
 					required: [],
 				},
 			},
@@ -129,7 +129,7 @@ function createMcpServer(): Server {
 				description: 'Get training strain history and workout data.',
 				inputSchema: {
 					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
+					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
 					required: [],
 				},
 			},
@@ -138,9 +138,27 @@ function createMcpServer(): Server {
 				description: 'Manually trigger a data sync from Whoop.',
 				inputSchema: {
 					type: 'object',
-					properties: { full: { type: 'boolean', description: 'Force a full 90-day sync (default: false)' } },
+					properties: { full: { type: 'boolean', description: 'Run a full historical backfill of your entire WHOOP account, as far back as the data goes (default: false)' } },
 					required: [],
 				},
+			},
+			{
+				name: 'get_records',
+				description: 'Return full raw records (every stored field) for a data type over a time window, as JSON, for detailed analysis. Use this instead of the summary tools when you need fields like sleep stages, SpO2, skin temp, respiratory rate, sleep debt, disturbances, or workout HR-zone durations.',
+				inputSchema: {
+					type: 'object',
+					properties: {
+						type: { type: 'string', enum: ['recovery', 'sleep', 'cycles', 'workouts'], description: 'Which data type to return.' },
+						days: { type: 'number', description: 'How many days back from today (default: 14, max: 3650).' },
+						limit: { type: 'number', description: 'Max records to return, most recent first (default: 500, max: 2000).' },
+					},
+					required: ['type'],
+				},
+			},
+			{
+				name: 'get_profile',
+				description: "Return the user's WHOOP profile (name, email) and latest body measurement (height, weight, max heart rate).",
+				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
 			{
 				name: 'get_auth_url',
@@ -286,29 +304,106 @@ function createMcpServer(): Server {
 				case 'sync_data': {
 					const tokens = db.getTokens();
 					if (!tokens) {
-						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Use get_auth_url to authorize first.' }] };
+						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
 					}
 					client.setTokens(tokens);
 
 					const full = validateBoolean(typedArgs.full);
-					let stats;
 
 					if (full) {
-						stats = await sync.syncDays(90);
-					} else {
-						const result = await sync.smartSync();
-						if (result.type === 'skip') {
-							return { content: [{ type: 'text', text: 'Data is already up to date (synced within the last hour).' }] };
-						}
-						stats = result.stats;
+						// A full backfill pages through the entire account and can take a
+						// few minutes, so run it in the background and return right away
+						// rather than holding the tool call open until it times out.
+						sync.syncAll()
+							.then(s => console.log('[sync] full backfill complete', s))
+							.catch(e => console.error('[sync] full backfill failed', e instanceof Error ? e.message : e));
+						return {
+							content: [{
+								type: 'text',
+								text: 'Full historical backfill started in the background. It pulls your entire WHOOP history and usually takes a couple of minutes. Give it a moment, then ask for whatever you want to look at — once it finishes, queries and analysis cover your full history.',
+							}],
+						};
 					}
 
+					const result = await sync.smartSync();
+					if (result.type === 'skip') {
+						return { content: [{ type: 'text', text: 'Data is already up to date (synced within the last hour).' }] };
+					}
+					const stats = result.stats;
 					return {
 						content: [{
 							type: 'text',
 							text: `Sync complete!\n- Cycles: ${stats?.cycles}\n- Recoveries: ${stats?.recoveries}\n- Sleeps: ${stats?.sleeps}\n- Workouts: ${stats?.workouts}`,
 						}],
 					};
+				}
+
+				case 'get_records': {
+					const tokens = db.getTokens();
+					if (!tokens) {
+						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
+					}
+					client.setTokens(tokens);
+					try {
+						await sync.smartSync();
+					} catch {
+						// Continue with cached data
+					}
+
+					const type = String((typedArgs as { type?: string }).type ?? '');
+					const days = validateDays(typedArgs.days);
+					const rawLimit = (typedArgs as { limit?: number }).limit;
+					const limit = Math.min(Math.max(Number.parseInt(String(rawLimit ?? 500), 10) || 500, 1), 2000);
+
+					const end = new Date();
+					const start = new Date();
+					start.setDate(start.getDate() - days);
+					const startIso = start.toISOString();
+					const endIso = end.toISOString();
+
+					let rows: Array<Record<string, unknown>>;
+					switch (type) {
+						case 'recovery':
+							rows = db.getRecoveriesByDateRange(startIso, endIso) as unknown as Array<Record<string, unknown>>;
+							break;
+						case 'sleep':
+							rows = db.getSleepsByDateRange(startIso, endIso, true) as unknown as Array<Record<string, unknown>>;
+							break;
+						case 'cycles':
+							rows = db.getCyclesByDateRange(startIso, endIso) as unknown as Array<Record<string, unknown>>;
+							break;
+						case 'workouts':
+							rows = db.getWorkoutsByDateRange(startIso, endIso) as unknown as Array<Record<string, unknown>>;
+							break;
+						default:
+							return { content: [{ type: 'text', text: "Invalid type. Use one of: recovery, sleep, cycles, workouts." }] };
+					}
+
+					const total = rows.length;
+					const truncated = total > limit;
+					const out = truncated ? rows.slice(0, limit) : rows;
+					const payload = {
+						type,
+						days,
+						returned: out.length,
+						total_in_window: total,
+						truncated,
+						records: out,
+					};
+					return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+				}
+
+				case 'get_profile': {
+					const tokens = db.getTokens();
+					if (!tokens) {
+						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
+					}
+					const profile = db.getProfile();
+					const body = db.getBodyMeasurement();
+					if (!profile && !body) {
+						return { content: [{ type: 'text', text: 'No profile or body measurement stored yet. Run sync_data first.' }] };
+					}
+					return { content: [{ type: 'text', text: JSON.stringify({ profile, body_measurement: body }) }] };
 				}
 
 				case 'get_auth_url': {
