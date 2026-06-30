@@ -42,6 +42,8 @@ export class WhoopSync {
 		if (sleeps.length > 0) this.db.upsertSleeps(sleeps);
 		if (workouts.length > 0) this.db.upsertWorkouts(workouts);
 
+		await this.syncProfileAndBody();
+
 		this.db.updateSyncState(
 			startDate.toISOString().split('T')[0],
 			endDate.toISOString().split('T')[0]
@@ -57,6 +59,47 @@ export class WhoopSync {
 
 	async quickSync(): Promise<SyncStats> {
 		return this.syncDays(7);
+	}
+
+	// Full historical backfill: pulls the entire account history (no date bound).
+	// The getAll* methods paginate from the most recent record all the way back.
+	async syncAll(): Promise<SyncStats> {
+		// Pull sequentially (not Promise.all) to keep the request rate gentle on
+		// WHOOP's API during a potentially multi-year backfill.
+		const cycles = await this.client.getAllCycles();
+		const recoveries = await this.client.getAllRecoveries();
+		const sleeps = await this.client.getAllSleeps();
+		const workouts = await this.client.getAllWorkouts();
+
+		if (cycles.length > 0) this.db.upsertCycles(cycles);
+		if (recoveries.length > 0) this.db.upsertRecoveries(recoveries);
+		if (sleeps.length > 0) this.db.upsertSleeps(sleeps);
+		if (workouts.length > 0) this.db.upsertWorkouts(workouts);
+
+		await this.syncProfileAndBody();
+
+		// Mark coverage as "from before WHOOP existed" through today.
+		this.db.updateSyncState('2014-01-01', new Date().toISOString().split('T')[0]);
+
+		return {
+			cycles: cycles.length,
+			recoveries: recoveries.length,
+			sleeps: sleeps.length,
+			workouts: workouts.length,
+		};
+	}
+
+	private async syncProfileAndBody(): Promise<void> {
+		try {
+			const [profile, body] = await Promise.all([
+				this.client.getProfile(),
+				this.client.getBodyMeasurement(),
+			]);
+			this.db.saveProfile(profile);
+			this.db.saveBodyMeasurement(body);
+		} catch {
+			// Profile/body are optional context; ignore failures so a sync still succeeds.
+		}
 	}
 
 	needsFullSync(): boolean {
