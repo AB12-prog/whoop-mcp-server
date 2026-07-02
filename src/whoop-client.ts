@@ -83,7 +83,19 @@ export class WhoopClient {
 		return tokens;
 	}
 
+	private refreshPromise: Promise<void> | null = null;
+
 	private async refreshTokens(): Promise<void> {
+		// Single-flight: WHOOP rotates refresh tokens on every use, so concurrent
+		// refreshes (e.g. syncDays' Promise.all) invalidate each other. All
+		// concurrent callers share one in-flight refresh.
+		this.refreshPromise ??= this.doRefreshTokens().finally(() => {
+			this.refreshPromise = null;
+		});
+		return this.refreshPromise;
+	}
+
+	private async doRefreshTokens(): Promise<void> {
 		if (!this.tokens?.refresh_token) {
 			throw new Error('No refresh token available');
 		}
@@ -96,6 +108,7 @@ export class WhoopClient {
 				refresh_token: this.tokens.refresh_token,
 				client_id: this.clientId,
 				client_secret: this.clientSecret,
+				scope: 'offline', // REQUIRED by WHOOP for a new refresh token to be returned
 			}),
 		});
 
@@ -103,10 +116,12 @@ export class WhoopClient {
 			throw new Error(`Token refresh failed: ${await response.text()}`);
 		}
 
-		const data = await response.json() as { access_token: string; refresh_token: string; expires_in: number };
+		const data = await response.json() as { access_token: string; refresh_token?: string; expires_in: number };
 		this.tokens = {
 			access_token: data.access_token,
-			refresh_token: data.refresh_token,
+			// Defensive: if WHOOP ever omits a new refresh token, keep the old one
+			// rather than storing undefined (which permanently kills the session).
+			refresh_token: data.refresh_token ?? this.tokens.refresh_token,
 			expires_at: Date.now() + data.expires_in * 1000,
 		};
 
@@ -129,9 +144,17 @@ export class WhoopClient {
 			}
 		}
 
-		const response = await fetch(url.toString(), {
-			headers: { Authorization: `Bearer ${this.tokens.access_token}` },
+		const doFetch = () => fetch(url.toString(), {
+			headers: { Authorization: `Bearer ${this.tokens!.access_token}` },
 		});
+
+		let response = await doFetch();
+
+		// If WHOOP invalidated the access token early, refresh once and retry.
+		if (response.status === 401) {
+			await this.refreshTokens();
+			response = await doFetch();
+		}
 
 		if (!response.ok) {
 			throw new Error(`API request failed: ${response.status} ${await response.text()}`);
