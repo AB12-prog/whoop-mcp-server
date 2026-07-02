@@ -37,7 +37,7 @@ const WHOOP_SCOPES = [
 	'offline',
 ];
 
-const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const ACCESS_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — fewer refreshes = fewer races with Claude
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -353,10 +353,26 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 				return;
 			}
 
-			// Rotate: invalidate the old token pair, issue a new one.
-			db.prepare('DELETE FROM oauth_tokens WHERE refresh_hash = ?').run(sha256hex(refresh_token));
-			console.log('[oauth] /token refresh OK, rotating tokens');
-			res.json(issueTokens(client_id));
+			// No rotation: mint a new access token, return the SAME refresh token,
+			// slide the 30-day expiry. Claude refreshes from multiple surfaces and
+			// retries on network hiccups; single-use rotation turned any concurrent
+			// or retried refresh into invalid_grant -> "reconnect the connector".
+			const accessToken = randomToken();
+			const now = Date.now();
+			db.prepare(`
+				UPDATE oauth_tokens
+				SET access_hash = ?, access_expires_at = ?, refresh_expires_at = ?
+				WHERE refresh_hash = ?
+			`).run(sha256hex(accessToken), now + ACCESS_TOKEN_TTL_MS, now + REFRESH_TOKEN_TTL_MS, sha256hex(refresh_token));
+
+			console.log('[oauth] /token refresh OK (non-rotating)');
+			res.json({
+				access_token: accessToken,
+				token_type: 'Bearer',
+				expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+				refresh_token,
+				scope: 'whoop:read',
+			});
 			return;
 		}
 
