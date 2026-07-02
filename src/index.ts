@@ -462,6 +462,23 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
+		// Scheduled-sync endpoint: the Railway cron service pings this hourly.
+		// smartSync already skips if it synced <1h ago, so dashboard opens and
+		// cron runs never double-pull.
+		app.post('/sync', async (req: Request, res: Response) => {
+			if (req.header('x-sync-secret') !== process.env.SYNC_SECRET) {
+				res.status(401).json({ error: 'unauthorized' });
+				return;
+			}
+			try {
+				const result = await sync.smartSync();
+				res.json({ ok: true, ...result });
+			} catch (err) {
+				console.error('[sync] error', err);
+				res.status(500).json({ ok: false, error: String(err) });
+			}
+		});
+
 		app.all('/mcp', requireMcpAuth, async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
