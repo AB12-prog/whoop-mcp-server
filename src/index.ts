@@ -2,6 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
@@ -53,7 +54,7 @@ function cleanupStaleSessions(): void {
 setInterval(cleanupStaleSessions, 5 * 60 * 1000);
 
 function formatDuration(millis: number | null): string {
-	if (!millis) return 'N/A';
+	if (millis == null || Number.isNaN(millis)) return 'N/A';
 	const hours = Math.floor(millis / 3_600_000);
 	const minutes = Math.floor((millis % 3_600_000) / 60_000);
 	return `${hours}h ${minutes}m`;
@@ -452,9 +453,38 @@ async function main(): Promise<void> {
 			whoopClientId: config.clientId,
 			whoopRedirectUri: config.redirectUri,
 			exchangeAndSaveWhoopCode: async (code: string) => {
-				const tokens = await client.exchangeCodeForTokens(code);
-				db.saveTokens(tokens);
-				sync.syncDays(90).catch(() => {});
+				// Any WHOOP account can complete the proxied login, but this server
+				// stores exactly one user's data. Verify the account that just logged
+				// in is the account this server is bound to before persisting anything,
+				// otherwise a stranger connecting their own WHOOP account would (a)
+				// overwrite the owner's tokens and (b) get an MCP token that reads the
+				// owner's stored health history.
+				const previousTokens = db.getTokens();
+				try {
+					const tokens = await client.exchangeCodeForTokens(code);
+					const profile = await client.getProfile();
+
+					const allowedUserId = (process.env.WHOOP_ALLOWED_USER_ID ?? '').trim();
+					const storedProfile = db.getProfile();
+					if (allowedUserId && String(profile.user_id) !== allowedUserId) {
+						throw new Error(`WHOOP user ${profile.user_id} is not the allowed user for this server`);
+					}
+					if (!allowedUserId && storedProfile?.user_id != null && storedProfile.user_id !== profile.user_id) {
+						throw new Error(`WHOOP user ${profile.user_id} does not match the account this server is bound to`);
+					}
+
+					db.saveTokens(tokens);
+					db.saveProfile(profile);
+					sync.syncDays(90).catch(() => {});
+				} catch (err) {
+					// Don't leave the rejected login's tokens on the shared client.
+					if (previousTokens) {
+						client.setTokens(previousTokens);
+					} else {
+						client.clearTokens();
+					}
+					throw err;
+				}
 			},
 		});
 
@@ -466,7 +496,18 @@ async function main(): Promise<void> {
 		// smartSync already skips if it synced <1h ago, so dashboard opens and
 		// cron runs never double-pull.
 		app.post('/sync', async (req: Request, res: Response) => {
-			if (req.header('x-sync-secret') !== process.env.SYNC_SECRET) {
+			// Fail closed if SYNC_SECRET isn't configured — a strict !== against an
+			// unset env var would let a missing header through. Compare in constant
+			// time so the secret can't be recovered byte-by-byte.
+			const secret = process.env.SYNC_SECRET ?? '';
+			const provided = req.header('x-sync-secret') ?? '';
+			const secretBuf = Buffer.from(secret);
+			const providedBuf = Buffer.from(provided);
+			const authorized =
+				secret.length > 0 &&
+				secretBuf.length === providedBuf.length &&
+				timingSafeEqual(secretBuf, providedBuf);
+			if (!authorized) {
 				res.status(401).json({ error: 'unauthorized' });
 				return;
 			}
@@ -475,7 +516,7 @@ async function main(): Promise<void> {
 				res.json({ ok: true, ...result });
 			} catch (err) {
 				console.error('[sync] error', err);
-				res.status(500).json({ ok: false, error: String(err) });
+				res.status(500).json({ ok: false, error: 'sync failed' });
 			}
 		});
 
