@@ -110,8 +110,22 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		db.prepare('DELETE FROM oauth_pending WHERE created_at < ?').run(now - PENDING_TTL_MS);
 		db.prepare('DELETE FROM oauth_codes WHERE created_at < ?').run(now - AUTH_CODE_TTL_MS);
 		db.prepare('DELETE FROM oauth_tokens WHERE refresh_expires_at < ?').run(now);
+		// Registration is unauthenticated, so registered clients accumulate.
+		// Drop clients that are old and hold no live tokens (an active Claude
+		// client always has a token row, and re-registers if ever pruned).
+		db.prepare(`
+			DELETE FROM oauth_clients
+			WHERE created_at < ?
+			AND client_id NOT IN (SELECT client_id FROM oauth_tokens)
+		`).run(now - 30 * 24 * 60 * 60 * 1000);
 	}
 	setInterval(cleanup, 5 * 60 * 1000);
+
+	// Simple in-memory rate limit for the unauthenticated /register endpoint.
+	const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+	const REGISTER_MAX_PER_WINDOW = 30;
+	let registerWindowStart = Date.now();
+	let registerCount = 0;
 
 	// ---- Discovery metadata -------------------------------------------------
 
@@ -143,6 +157,17 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 	// ---- Dynamic Client Registration (RFC 7591) -----------------------------
 
 	app.post('/register', (req: Request, res: Response) => {
+		const now = Date.now();
+		if (now - registerWindowStart > REGISTER_WINDOW_MS) {
+			registerWindowStart = now;
+			registerCount = 0;
+		}
+		if (registerCount >= REGISTER_MAX_PER_WINDOW) {
+			res.status(429).json({ error: 'too_many_requests', error_description: 'registration rate limit exceeded' });
+			return;
+		}
+		registerCount++;
+
 		const body = (req.body ?? {}) as { redirect_uris?: unknown };
 		const redirectUris = Array.isArray(body.redirect_uris)
 			? body.redirect_uris.filter((u): u is string => typeof u === 'string')
