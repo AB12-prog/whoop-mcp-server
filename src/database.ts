@@ -237,19 +237,27 @@ export class WhoopDatabase {
 		const row = this.db.prepare('SELECT * FROM tokens WHERE id = 1').get() as TokenRow | undefined;
 		if (!row) return null;
 
-		const accessToken = isEncrypted(row.access_token)
-			? decrypt(row.access_token)
-			: row.access_token;
+		// If the encryption secret changed, stored tokens are unrecoverable.
+		// Report "not authenticated" (prompting a re-auth) instead of throwing,
+		// which would take down every endpoint that checks auth state.
+		try {
+			const accessToken = isEncrypted(row.access_token)
+				? decrypt(row.access_token)
+				: row.access_token;
 
-		const refreshToken = isEncrypted(row.refresh_token)
-			? decrypt(row.refresh_token)
-			: row.refresh_token;
+			const refreshToken = isEncrypted(row.refresh_token)
+				? decrypt(row.refresh_token)
+				: row.refresh_token;
 
-		return {
-			access_token: accessToken,
-			refresh_token: refreshToken,
-			expires_at: row.expires_at,
-		};
+			return {
+				access_token: accessToken,
+				refresh_token: refreshToken,
+				expires_at: row.expires_at,
+			};
+		} catch (err) {
+			console.error('[db] failed to decrypt stored tokens (encryption secret changed?); treating as unauthenticated', err instanceof Error ? err.message : err);
+			return null;
+		}
 	}
 
 	getSyncState(): { lastSyncAt: string | null; oldestDate: string | null; newestDate: string | null } {
