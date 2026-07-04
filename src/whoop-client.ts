@@ -44,6 +44,10 @@ export class WhoopClient {
 		this.tokens = tokens;
 	}
 
+	clearTokens(): void {
+		this.tokens = null;
+	}
+
 	getAuthorizationUrl(scopes: string[]): string {
 		const params = new URLSearchParams({
 			client_id: this.clientId,
