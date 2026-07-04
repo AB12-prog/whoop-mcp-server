@@ -4,13 +4,17 @@ const ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
 const IV_LENGTH = 16;
 
+let cachedKey: Buffer | null = null;
+
 function getEncryptionKey(): Buffer {
+	if (cachedKey) return cachedKey;
 	const secret = process.env.ENCRYPTION_SECRET || process.env.WHOOP_CLIENT_SECRET;
 	if (!secret) {
 		throw new Error('No encryption secret available');
 	}
 	const salt = Buffer.from('whoop-mcp-token-encryption', 'utf8');
-	return scryptSync(secret, salt, KEY_LENGTH);
+	cachedKey = scryptSync(secret, salt, KEY_LENGTH);
+	return cachedKey;
 }
 
 export function encrypt(text: string): string {
