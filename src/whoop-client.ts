@@ -12,11 +12,29 @@ import type {
 const WHOOP_API_BASE = 'https://api.prod.whoop.com/developer';
 const WHOOP_AUTH_BASE = 'https://api.prod.whoop.com/oauth/oauth2';
 
+// Refresh when the access token has less than this long left to live.
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+// The stored WHOOP grant is unusable (no tokens, or WHOOP rejected the refresh
+// token). Unlike a transient failure, retrying cannot fix this — the user has
+// to re-authorize.
+export class WhoopAuthError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'WhoopAuthError';
+	}
+}
+
 interface WhoopClientConfig {
 	clientId: string;
 	clientSecret: string;
 	redirectUri: string;
 	onTokenRefresh?: (tokens: WhoopTokens) => void;
+	// Returns the most recently persisted tokens. Refreshes always start from
+	// these: WHOOP rotates the refresh token on every use and revokes the whole
+	// grant when a rotated token is replayed, so a process must never refresh
+	// with an in-memory token that another process has already spent.
+	loadTokens?: () => WhoopTokens | null;
 }
 
 interface PaginationParams {
@@ -32,12 +50,14 @@ export class WhoopClient {
 	private readonly clientSecret: string;
 	private readonly redirectUri: string;
 	private readonly onTokenRefresh?: (tokens: WhoopTokens) => void;
+	private readonly loadTokens?: () => WhoopTokens | null;
 
 	constructor(config: WhoopClientConfig) {
 		this.clientId = config.clientId;
 		this.clientSecret = config.clientSecret;
 		this.redirectUri = config.redirectUri;
 		this.onTokenRefresh = config.onTokenRefresh;
+		this.loadTokens = config.loadTokens;
 	}
 
 	setTokens(tokens: WhoopTokens): void {
@@ -99,45 +119,135 @@ export class WhoopClient {
 		return this.refreshPromise;
 	}
 
-	private async doRefreshTokens(): Promise<void> {
-		if (!this.tokens?.refresh_token) {
-			throw new Error('No refresh token available');
+	// Swap to the persisted tokens if they carry a different refresh token than
+	// the in-memory copy (i.e. another process rotated more recently — during a
+	// deploy the old and new containers briefly overlap, each with its own
+	// in-memory copy). Returns true if tokens were adopted.
+	private adoptStoredTokens(): boolean {
+		const stored = this.loadTokens?.() ?? null;
+		if (!stored || stored.refresh_token === this.tokens?.refresh_token) {
+			return false;
 		}
+		console.log('[whoop] adopting newer persisted tokens (rotated outside this process)');
+		this.tokens = stored;
+		return true;
+	}
 
-		const response = await fetch(`${WHOOP_AUTH_BASE}/token`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-			body: new URLSearchParams({
-				grant_type: 'refresh_token',
-				refresh_token: this.tokens.refresh_token,
-				client_id: this.clientId,
-				client_secret: this.clientSecret,
-				scope: 'offline', // REQUIRED by WHOOP for a new refresh token to be returned
-			}),
-		});
+	private hasFreshAccessToken(): boolean {
+		return this.tokens != null && this.tokens.expires_at - Date.now() >= TOKEN_REFRESH_MARGIN_MS;
+	}
 
-		if (!response.ok) {
-			throw new Error(`Token refresh failed: ${await response.text()}`);
+	// Returns null when the request never got a response (DNS, connect, reset).
+	private async postRefresh(refreshToken: string): Promise<globalThis.Response | null> {
+		try {
+			return await fetch(`${WHOOP_AUTH_BASE}/token`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({
+					grant_type: 'refresh_token',
+					refresh_token: refreshToken,
+					client_id: this.clientId,
+					client_secret: this.clientSecret,
+					scope: 'offline', // REQUIRED by WHOOP for a new refresh token to be returned
+				}),
+			});
+		} catch (err) {
+			console.error('[whoop] token refresh request failed to send:', err instanceof Error ? err.message : err);
+			return null;
 		}
+	}
 
+	private async acceptRefreshResponse(response: globalThis.Response): Promise<void> {
 		const data = await response.json() as { access_token: string; refresh_token?: string; expires_in: number };
 		this.tokens = {
 			access_token: data.access_token,
 			// Defensive: if WHOOP ever omits a new refresh token, keep the old one
 			// rather than storing undefined (which permanently kills the session).
-			refresh_token: data.refresh_token ?? this.tokens.refresh_token,
+			refresh_token: data.refresh_token ?? this.tokens!.refresh_token,
 			expires_at: Date.now() + data.expires_in * 1000,
 		};
+		console.log(`[whoop] token refresh ok (rt …${this.tokens.refresh_token.slice(-6)})`);
+		this.persistTokens();
+	}
 
-		this.onTokenRefresh?.(this.tokens);
+	private persistTokens(): void {
+		if (!this.onTokenRefresh || !this.tokens) return;
+		try {
+			this.onTokenRefresh(this.tokens);
+		} catch (err) {
+			// A rotated refresh token that never reaches the database strands the
+			// grant on the next restart. Retry once, then make the failure loud so
+			// it's findable in the logs when that happens.
+			try {
+				this.onTokenRefresh(this.tokens);
+			} catch {
+				console.error(
+					'[whoop] CRITICAL: rotated refresh token could not be persisted; a restart before the next successful save will require re-authorization.',
+					err instanceof Error ? err.message : err
+				);
+			}
+		}
+	}
+
+	private async doRefreshTokens(): Promise<void> {
+		// Always rotate from the most recently persisted token. If another
+		// process already rotated and its access token is still fresh, use that
+		// instead of spending another rotation.
+		if (this.adoptStoredTokens() && this.hasFreshAccessToken()) {
+			return;
+		}
+
+		if (!this.tokens?.refresh_token) {
+			throw new WhoopAuthError('Not authenticated with WHOOP: no refresh token available');
+		}
+
+		let response = await this.postRefresh(this.tokens.refresh_token);
+
+		// Each refresh token is single-use, so a failed rotation can strand the
+		// whole grant. Retry outages (no response, 5xx, 429) before giving up:
+		// if the request never reached WHOOP the token is still unspent and the
+		// retry succeeds; if it did reach WHOOP the token is already spent
+		// either way, so retrying loses nothing.
+		for (let attempt = 1; attempt <= 2 && (response === null || response.status >= 500 || response.status === 429); attempt++) {
+			await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+			response = await this.postRefresh(this.tokens.refresh_token);
+		}
+
+		if (response === null || response.status >= 500 || response.status === 429) {
+			const detail = response ? `WHOOP responded ${response.status}` : 'network error reaching WHOOP';
+			throw new Error(`Token refresh failed: ${detail}; will retry on the next sync`);
+		}
+
+		if (!response.ok) {
+			const body = await response.text();
+			// A 4xx means WHOOP no longer accepts the token we sent. Before
+			// declaring the grant dead, check whether another process persisted a
+			// newer rotation while we were trying, and finish with that one.
+			if (this.adoptStoredTokens()) {
+				if (this.hasFreshAccessToken()) return;
+				const retry = await this.postRefresh(this.tokens.refresh_token);
+				if (retry?.ok) {
+					await this.acceptRefreshResponse(retry);
+					return;
+				}
+			}
+			throw new WhoopAuthError(`WHOOP rejected the stored refresh token (${response.status} ${body}); re-authorization is required`);
+		}
+
+		await this.acceptRefreshResponse(response);
 	}
 
 	private async request<T>(path: string, params?: Record<string, string>): Promise<T> {
 		if (!this.tokens) {
-			throw new Error('Not authenticated');
+			// Tokens may have been persisted after this process loaded (e.g. a
+			// re-authorization completed while the server was already running).
+			this.tokens = this.loadTokens?.() ?? null;
+		}
+		if (!this.tokens) {
+			throw new WhoopAuthError('Not authenticated with WHOOP');
 		}
 
-		if (this.tokens.expires_at - Date.now() < 5 * 60 * 1000) {
+		if (this.tokens.expires_at - Date.now() < TOKEN_REFRESH_MARGIN_MS) {
 			await this.refreshTokens();
 		}
 

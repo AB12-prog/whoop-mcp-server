@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
-import { WhoopClient } from './whoop-client.js';
+import { WhoopClient, WhoopAuthError } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
 import { mountOAuthProxy } from './oauth-proxy.js';
@@ -29,6 +29,7 @@ const client = new WhoopClient({
 	clientSecret: config.clientSecret,
 	redirectUri: config.redirectUri,
 	onTokenRefresh: tokens => db.saveTokens(tokens),
+	loadTokens: () => db.getTokens(),
 });
 
 const existingTokens = db.getTokens();
@@ -183,8 +184,10 @@ function createMcpServer(): Server {
 				client.setTokens(tokens);
 				try {
 					await sync.smartSync();
-				} catch {
-					// Continue with cached data
+				} catch (err) {
+					// Continue with cached data, but leave a trace — silent failures
+					// here previously hid a dying WHOOP grant for a whole day.
+					console.error('[sync] pre-tool sync failed; serving cached data:', err instanceof Error ? err.message : err);
 				}
 			}
 
@@ -408,12 +411,22 @@ function createMcpServer(): Server {
 				}
 
 				case 'get_auth_url': {
-					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
-					const url = client.getAuthorizationUrl(scopes);
+					// The /reauth flow registers its state in oauth_pending, which
+					// /callback requires. A raw getAuthorizationUrl() link can never
+					// complete: its state is unknown to /callback and gets rejected.
+					const base = (process.env.BASE_URL ?? '').replace(/\/+$/, '');
+					if (!base) {
+						return {
+							content: [{
+								type: 'text',
+								text: 'BASE_URL is not configured, so no re-authorization URL is available. In HTTP mode, set BASE_URL and visit /reauth on the server.',
+							}],
+						};
+					}
 					return {
 						content: [{
 							type: 'text',
-							text: `To authorize with Whoop:\n\n1. Visit: ${url}\n2. Log in and authorize\n3. You'll be redirected back automatically\n\nRedirect URI: ${config.redirectUri}`,
+							text: `To (re)authorize WHOOP:\n\n1. Visit: ${base}/reauth\n2. Log in to WHOOP and approve access\n3. You'll see a confirmation once tokens are saved\n\nThis re-links the WHOOP account this server is bound to; scheduled syncs resume immediately after.`,
 						}],
 					};
 				}
@@ -489,7 +502,13 @@ async function main(): Promise<void> {
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
-			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
+			// token_updated_at is the last successful rotation's save time — if the
+			// grant dies, it pins down when the last good refresh happened.
+			res.json({
+				status: 'ok',
+				authenticated: Boolean(db.getTokens()),
+				token_updated_at: db.getTokenUpdatedAt(),
+			});
 		});
 
 		// Scheduled-sync endpoint: the Railway cron service pings this hourly.
@@ -516,7 +535,19 @@ async function main(): Promise<void> {
 				res.json({ ok: true, ...result });
 			} catch (err) {
 				console.error('[sync] error', err);
-				res.status(500).json({ ok: false, error: 'sync failed' });
+				const detail = err instanceof Error ? err.message : String(err);
+				// Put the real reason in the response: the cron runner prints the
+				// body, so its logs say what broke instead of a bare "sync failed".
+				if (err instanceof WhoopAuthError) {
+					res.status(401).json({
+						ok: false,
+						error: 'whoop auth expired',
+						detail,
+						action: `re-authorize at ${baseUrl}/reauth`,
+					});
+				} else {
+					res.status(500).json({ ok: false, error: 'sync failed', detail });
+				}
 			}
 		});
 
