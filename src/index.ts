@@ -554,6 +554,22 @@ async function main(): Promise<void> {
 		app.all('/mcp', requireMcpAuth, async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
+			// A presented session id we don't recognize means the session is gone —
+			// a restart cleared the in-memory map, or the idle TTL reaped it. The
+			// MCP streamable-HTTP spec says to answer 404 so the client silently
+			// re-initializes. The previous behavior (handing the request to a fresh
+			// uninitialized transport) produced a 400 "server not initialized" that
+			// clients don't recover from, leaving every connected client broken
+			// after each deploy until it was manually reconnected.
+			if (sessionId && !transports.has(sessionId)) {
+				res.status(404).json({
+					jsonrpc: '2.0',
+					error: { code: -32001, message: 'Session not found' },
+					id: null,
+				});
+				return;
+			}
+
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
 				const session = transports.get(sessionId)!;
 				await session.transport.close();
