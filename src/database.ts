@@ -260,6 +260,11 @@ export class WhoopDatabase {
 		}
 	}
 
+	getTokenUpdatedAt(): string | null {
+		const row = this.db.prepare('SELECT updated_at FROM tokens WHERE id = 1').get() as { updated_at: string } | undefined;
+		return row?.updated_at ?? null;
+	}
+
 	getSyncState(): { lastSyncAt: string | null; oldestDate: string | null; newestDate: string | null } {
 		const row = this.db.prepare('SELECT * FROM sync_state WHERE id = 1').get() as SyncStateRow | undefined;
 		return {

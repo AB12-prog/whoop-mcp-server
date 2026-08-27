@@ -257,6 +257,34 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		res.redirect(`${WHOOP_AUTH_BASE}/auth?${params.toString()}`);
 	});
 
+	// ---- Direct WHOOP re-authorization --------------------------------------
+	//
+	// Refreshes only the WHOOP side of the setup (new WHOOP grant, tokens saved)
+	// without touching Claude's connector tokens — for when the WHOOP refresh
+	// token chain dies but the connector itself still works. Unauthenticated by
+	// design, and safe that way: /callback only accepts a state this server
+	// issued, and exchangeAndSaveWhoopCode refuses to persist tokens for any
+	// WHOOP account other than the one this server is bound to.
+	const REAUTH_CLIENT_ID = '__whoop_reauth__';
+
+	app.get('/reauth', (_req: Request, res: Response) => {
+		const whoopState = crypto.randomUUID();
+		db.prepare(`
+			INSERT INTO oauth_pending (whoop_state, client_id, redirect_uri, code_challenge, client_state, created_at)
+			VALUES (?, ?, '', '', NULL, ?)
+		`).run(whoopState, REAUTH_CLIENT_ID, Date.now());
+
+		console.log('[oauth] /reauth -> redirecting to WHOOP login');
+		const params = new URLSearchParams({
+			client_id: whoopClientId,
+			redirect_uri: whoopRedirectUri,
+			response_type: 'code',
+			scope: WHOOP_SCOPES.join(' '),
+			state: whoopState,
+		});
+		res.redirect(`${WHOOP_AUTH_BASE}/auth?${params.toString()}`);
+	});
+
 	// ---- WHOOP callback (completes both WHOOP auth and Claude's flow) --------
 
 	app.get('/callback', async (req: Request, res: Response) => {
@@ -298,6 +326,14 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		}
 
 		db.prepare('DELETE FROM oauth_pending WHERE whoop_state = ?').run(state);
+
+		// A /reauth flow ends here: WHOOP tokens are saved and there is no
+		// Claude client waiting for an authorization code.
+		if (pending.client_id === REAUTH_CLIENT_ID) {
+			console.log('[oauth] /callback re-auth complete');
+			res.type('text/plain').send('WHOOP re-connected. Scheduled syncs will resume; you can close this tab.');
+			return;
+		}
 
 		const authCode = randomToken();
 		db.prepare(`
