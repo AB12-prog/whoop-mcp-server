@@ -2,7 +2,7 @@
 // Zero dependencies (Node 18+ has global fetch). Holds no Whoop token, so there
 // is no rotation clash — the connector stays the sole token owner.
 //
-// Env:  CONNECTOR_URL  (e.g. https://whoop-mcp-server-production-85e0.up.railway.app)
+// Env:  CONNECTOR_URL  (e.g. https://your-app.up.railway.app)
 //       SYNC_SECRET    (same value set on the connector)
 
 const base = (process.env.CONNECTOR_URL || '').replace(/\/$/, '');

@@ -6,7 +6,7 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 
 - **Garmin** — Garmin's official Health API is partner-only, so this uses the unofficial Garmin Connect API via [python-garminconnect](https://github.com/cyberjunky/python-garminconnect), run as a localhost-only Python sidecar (`garmin/bridge.py`) supervised by the Node server. Unofficial means it can break when Garmin changes things; redeploying picks up library fixes (`garmin/requirements.txt` allows minor updates).
 - **WHOOP** — kept as a read-only archive in the same SQLite volume. No automatic WHOOP pulls unless `WHOOP_SYNC=on`.
-- **Sign-in** — the connector's OAuth flow shows a sign-in page on this server: Garmin email, password, and Garmin's verification code if MFA is on. The password is relayed to Garmin and never stored. The server binds to the first (owner) Garmin account and refuses any other.
+- **Sign-in** — the connector's OAuth flow shows a sign-in page on this server: Garmin email, password, and Garmin's verification code if MFA is on. The password is relayed to Garmin and never stored. The server binds to the first (owner) Garmin account and refuses any other. Sign-in is throttled per IP and globally, and after 5 consecutive rejected attempts it locks for 15 minutes, doubling up to 24 hours (a successful sign-in or a redeploy resets it). Turn on two-step verification for your Garmin account: with it, a guessed password alone can't sign in.
 - **Writes** — workout, weigh-in and food tools are two-step: without `confirm: true` they validate and return a preview, saving nothing; Claude shows it, then confirms. Exercise names are matched to Garmin's catalogue (case/hyphen-insensitive); unclear names return choices rather than a guess.
 - **Storage** — Garmin tokens are AES-GCM encrypted in SQLite (same key as before). Everything else is stored normalised for querying, plus Garmin's raw JSON (large payloads gzipped) so nothing is lost:
   - **Daily** (16 Garmin calls per day): summary, sleep, HRV, training readiness (with factor breakdown), training status and 4-week load balance, all-day heart rate, stress and Body Battery, Body Battery events, respiration, SpO2, 15-minute steps, VO2 max / max metrics, fitness age, hydration, lifestyle logging, all-day events, and the Garmin food log (entries in `garmin_food_entries`, day totals in `garmin_daily.food_*`).
@@ -58,6 +58,7 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `GARMIN_ALLOWED_PROFILE_ID` | optional | Pin the owner by Garmin profile id instead |
 | `ENCRYPTION_SECRET` or `WHOOP_CLIENT_SECRET` | yes | Token encryption key — don't change it, or stored tokens become unreadable |
 | `SYNC_SECRET` | yes | Shared with the cron service (`trigger-sync.mjs`) |
+| `TRUST_PROXY_HOPS` | optional | Proxy hops in front of the app, for per-IP sign-in limits (default `1`, Railway's edge) |
 | `LOCAL_TIMEZONE` | optional | Default `Australia/Brisbane` (defines "today") |
 | `GARMIN_CALL_GAP_S` | optional | Pause between Garmin calls inside one fetch (default `0.4`) |
 | `GARMIN_MAX_CHART` | optional | Max time-series points per activity (default `4000`) |
@@ -73,7 +74,7 @@ Volume mounted at `/data` (`DB_PATH=/data/whoop.db`).
 
 - `/mcp` — MCP (Streamable HTTP, OAuth bearer)
 - `/reauth` — reconnect Garmin without touching the Claude connector
-- `/health` — Garmin connection/sync state and WHOOP archive state
+- `/health` — public liveness (`{"status":"ok"}`); send the `x-sync-secret` header for Garmin connection/sync state and WHOOP archive state
 - `POST /sync` — hourly cron target (`x-sync-secret` header); syncs Garmin (and WHOOP if `WHOOP_SYNC=on`)
 
 ## Local development
