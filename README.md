@@ -8,7 +8,12 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 - **WHOOP** — kept as a read-only archive in the same SQLite volume. No automatic WHOOP pulls unless `WHOOP_SYNC=on`.
 - **Sign-in** — the connector's OAuth flow shows a sign-in page on this server: Garmin email, password, and Garmin's verification code if MFA is on. The password is relayed to Garmin and never stored. The server binds to the first (owner) Garmin account and refuses any other.
 - **Writes** — workout and weigh-in tools are two-step: without `confirm: true` they validate and return a preview, saving nothing; Claude shows it, then confirms. Exercise names are matched to Garmin's catalogue (case/hyphen-insensitive); unclear names return choices rather than a guess.
-- **Storage** — Garmin tokens are AES-GCM encrypted in SQLite (same key as before). Daily metrics are stored normalised plus Garmin's raw JSON per source.
+- **Storage** — Garmin tokens are AES-GCM encrypted in SQLite (same key as before). Everything else is stored normalised for querying, plus Garmin's raw JSON (large payloads gzipped) so nothing is lost:
+  - **Daily** (16 Garmin calls per day): summary, sleep, HRV, training readiness (with factor breakdown), training status and 4-week load balance, all-day heart rate, stress and Body Battery, Body Battery events, respiration, SpO2, 15-minute steps, VO2 max / max metrics, fitness age, hydration, lifestyle logging, all-day events.
+  - **Intraday** (`garmin_intraday`): HR, stress, Body Battery, respiration, SpO2, steps, overnight HRV readings and sleep stages as `[epoch-ms, value]` rows.
+  - **Per activity**: full summary (pace, GAP, cadence, stride, ground contact, vertical oscillation/ratio, power, temperature, training-effect messages), laps/km splits, typed splits, HR and power zone time, weather, the recorded time series (up to 4,000 points), and strength exercise sets (exercise, reps, kg).
+  - **Profile** (refreshed daily): settings, HR zones, personal records, race predictions (+ a year of history), lactate threshold (+ history), endurance score, hill score, running tolerance, body composition, devices, goals, training plans.
+- **Sync** — the hourly sync re-pulls today and yesterday, fetches detail for up to 5 new activities, and refreshes profile data once a day. `garmin_sync` with `days` runs a paced background backfill (~15 s per day) that skips days already complete, so it is safe to re-run and resumes after a failure. On a Garmin rate limit it waits 10, 20, then 40 minutes before giving up. Two years of data is roughly 100–200 MB on the volume.
 
 ## MCP tools
 
@@ -16,10 +21,15 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 |---|---|
 | `garmin_today` | Readiness, last night's sleep + stages, HRV vs baseline, RHR, Body Battery, stress, steps, training status, today's activities |
 | `garmin_trends` | Day-by-day table + averages (readiness, HRV, RHR, sleep, Body Battery, stress, steps) |
-| `garmin_activities` | Activities with time, distance, HR, training effect, load |
+| `garmin_activities` | Activities with id, time, distance, pace, HR, cadence, training effect, load |
+| `garmin_activity_detail` | One activity in depth: running dynamics, weather, HR zones with boundaries, laps, strength sets, first-vs-second-half analysis with aerobic decoupling and HR drift, optional time series |
+| `garmin_intraday` | Bucketed intraday HR, stress, Body Battery, respiration, SpO2, steps, overnight HRV, sleep stages (local time) |
+| `garmin_profile` | HR zones, race predictions, lactate threshold, VO2 max, settings; any profile dataset as JSON |
 | `garmin_records` | Normalised rows as JSON (`daily` or `activities`) |
-| `garmin_raw` | Garmin's raw JSON for one date/source (`summary`, `sleep`, `hrv`, `readiness`, `training_status`) |
-| `garmin_sync` | Refresh now, or `days>7` for a paced background backfill |
+| `garmin_raw` | Garmin's raw JSON for one date + daily source, or one activity + activity source |
+| `garmin_schema` | Tables and columns available to `garmin_query` |
+| `garmin_query` | One read-only SQL `SELECT` over the whole database (separate read-only connection; credential tables refused; `gunzip_json(gz)` reads gzipped raw JSON) |
+| `garmin_sync` | Refresh now, or `days>7` for a resumable background backfill of everything (`refresh: true` re-fetches stored days) |
 | `garmin_auth_url` | Link to reconnect Garmin |
 | `garmin_workouts` | Workout library + upcoming calendar entries (with ids) |
 | `garmin_create_strength_workout` | Build a strength workout (sets × reps @ kg, rest); optional schedule date / send to watch |
@@ -41,6 +51,9 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `ENCRYPTION_SECRET` or `WHOOP_CLIENT_SECRET` | yes | Token encryption key — don't change it, or stored tokens become unreadable |
 | `SYNC_SECRET` | yes | Shared with the cron service (`trigger-sync.mjs`) |
 | `LOCAL_TIMEZONE` | optional | Default `Australia/Brisbane` (defines "today") |
+| `GARMIN_CALL_GAP_S` | optional | Pause between Garmin calls inside one fetch (default `0.4`) |
+| `GARMIN_MAX_CHART` | optional | Max time-series points per activity (default `4000`) |
+| `GARMIN_RATE_LIMIT_WAITS_MIN` | optional | Backfill back-off schedule in minutes (default `10,20,40`) |
 | `WHOOP_SYNC` | optional | `on` resumes automatic WHOOP pulls |
 | `WHOOP_CLIENT_ID`, `WHOOP_REDIRECT_URI` | optional | Only needed for `whoop_sync` |
 

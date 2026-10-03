@@ -525,6 +525,7 @@ async function main(): Promise<void> {
 					last_sync_at: garminState.last_sync_at,
 					stored_range: [garminState.oldest_date, garminState.newest_date],
 					last_error: garminState.last_error,
+					backfill: garminSync.backfillStatus(),
 				},
 				whoop: {
 					mode: config.whoopAutoSync ? 'syncing' : 'archive',
