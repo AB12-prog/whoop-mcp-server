@@ -14,6 +14,7 @@ import { mountOAuthProxy, LoginError, type LoginProvider } from './oauth-proxy.j
 import { GarminBridge, GarminBridgeError, GarminStore, GarminSync, type GarminAccount } from './garmin.js';
 import { garminToolDefs, GARMIN_TOOL_NAMES, handleGarminTool } from './garmin-tools.js';
 import { garminWriteToolDefs, GARMIN_WRITE_TOOL_NAMES, handleGarminWriteTool } from './garmin-write-tools.js';
+import { garminNutritionToolDefs, GARMIN_NUTRITION_TOOL_NAMES, handleGarminNutritionTool } from './garmin-nutrition-tools.js';
 
 interface ToolArguments {
 	days?: number;
@@ -207,6 +208,7 @@ function createMcpServer(): Server {
 		tools: [
 			...garminToolDefs,
 			...garminWriteToolDefs,
+			...garminNutritionToolDefs,
 			{
 				name: 'whoop_latest',
 				description: `${ARCHIVE_NOTE} Last recorded WHOOP recovery, sleep and strain.`,
@@ -265,6 +267,15 @@ function createMcpServer(): Server {
 			if (GARMIN_WRITE_TOOL_NAMES.has(name)) {
 				return await handleGarminWriteTool(name, (args ?? {}) as Record<string, unknown>, {
 					bridge: garminBridge,
+					sync: garminSync,
+					baseUrl: config.baseUrl,
+				});
+			}
+
+			if (GARMIN_NUTRITION_TOOL_NAMES.has(name)) {
+				return await handleGarminNutritionTool(name, (args ?? {}) as Record<string, unknown>, {
+					bridge: garminBridge,
+					store: garminStore,
 					sync: garminSync,
 					baseUrl: config.baseUrl,
 				});

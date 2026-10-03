@@ -217,7 +217,72 @@ const DAILY_COLUMNS: Record<string, ColType> = {
 	readiness_feedback_long: 'TEXT',
 	load_aerobic_low: 'REAL', load_aerobic_high: 'REAL', load_anaerobic: 'REAL', load_balance_feedback: 'TEXT',
 	fitness_age: 'REAL', fitness_age_achievable: 'REAL', hydration_ml: 'REAL', hydration_goal_ml: 'REAL', sweat_loss_ml: 'REAL',
+	food_kcal: 'REAL', food_protein_g: 'REAL', food_carbs_g: 'REAL', food_fat_g: 'REAL', food_fiber_g: 'REAL', food_items: 'INTEGER',
 };
+
+/** Daily columns derived from the food log — refreshed on their own after a nutrition write. */
+const FOOD_DAILY_COLUMNS = ['food_kcal', 'food_protein_g', 'food_carbs_g', 'food_fat_g', 'food_fiber_g', 'food_items'] as const;
+
+const FOOD_ENTRY_COLUMNS: Record<string, ColType> = {
+	date: 'TEXT', meal: 'TEXT', meal_time: 'TEXT', name: 'TEXT', brand: 'TEXT', category: 'TEXT',
+	food_id: 'TEXT', serving_id: 'TEXT', source: 'TEXT', servings: 'REAL', serving_unit: 'TEXT', serving_units: 'REAL',
+	kcal: 'REAL', protein_g: 'REAL', carbs_g: 'REAL', fat_g: 'REAL', fiber_g: 'REAL', sugar_g: 'REAL', sat_fat_g: 'REAL', sodium_mg: 'REAL',
+	logged_at: 'TEXT',
+};
+
+export type FoodEntry = { log_id: string } & Record<string, string | number | null>;
+
+const toNum = (v: unknown): number | null => {
+	const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
+	return typeof n === 'number' && Number.isFinite(n) ? n : null;
+};
+
+/** Flatten Garmin's food log ({mealDetails: [{meal, loggedFoods}]}) into entries with consumed amounts. */
+export function parseFoodLog(date: string, log: unknown): FoodEntry[] {
+	const out: FoodEntry[] = [];
+	const details = (log as { mealDetails?: unknown } | null)?.mealDetails;
+	for (const md of Array.isArray(details) ? details : []) {
+		const meal = (md as { meal?: { mealName?: unknown } })?.meal?.mealName;
+		const foods = (md as { loggedFoods?: unknown })?.loggedFoods;
+		for (const f of Array.isArray(foods) ? (foods as Array<Record<string, unknown>>) : []) {
+			if (typeof f?.logId !== 'string') continue;
+			const meta = (f.foodMetaData ?? {}) as Record<string, unknown>;
+			const nc = (f.nutritionContent ?? {}) as Record<string, unknown>;
+			const qty = toNum(f.servingQty) ?? 1;
+			// nutritionContent is per serving; servingQty multiplies it. Quick adds may carry totals on the entry itself.
+			const amt = (k: string) => {
+				const per = toNum(nc[k]);
+				if (per != null) return Math.round(per * qty * 100) / 100;
+				return toNum(f[k]);
+			};
+			out.push({
+				log_id: f.logId,
+				date,
+				meal: typeof meal === 'string' ? meal : null,
+				meal_time: typeof f.mealTime === 'string' ? f.mealTime : null,
+				name: String(meta.foodName ?? f.name ?? '') || null,
+				brand: typeof meta.brandName === 'string' ? meta.brandName : null,
+				category: typeof f.logCategory === 'string' ? f.logCategory : null,
+				food_id: meta.foodId != null ? String(meta.foodId) : null,
+				serving_id: nc.servingId != null ? String(nc.servingId) : null,
+				source: typeof meta.source === 'string' ? meta.source : null,
+				servings: qty,
+				serving_unit: typeof nc.servingUnit === 'string' ? nc.servingUnit : null,
+				serving_units: toNum(nc.numberOfUnits),
+				kcal: amt('calories'),
+				protein_g: amt('protein'),
+				carbs_g: amt('carbs'),
+				fat_g: amt('fat'),
+				fiber_g: amt('fiber'),
+				sugar_g: amt('sugar'),
+				sat_fat_g: amt('saturatedFat'),
+				sodium_mg: amt('sodium'),
+				logged_at: typeof f.logTimestamp === 'string' ? f.logTimestamp : null,
+			});
+		}
+	}
+	return out;
+}
 
 // Keep in step with normalise_activity() / _ACTIVITY_EXTRA_FIELDS in bridge.py.
 const ACTIVITY_COLUMNS: Record<string, ColType> = {
@@ -250,7 +315,7 @@ const SET_COLUMNS: Record<string, ColType> = {
 export const DAILY_SOURCES = [
 	'summary', 'sleep', 'hrv', 'readiness', 'training_status',
 	'heart_rates', 'stress', 'body_battery_events', 'respiration', 'spo2', 'steps',
-	'max_metrics', 'fitness_age', 'hydration', 'lifestyle', 'all_day_events',
+	'max_metrics', 'fitness_age', 'hydration', 'lifestyle', 'all_day_events', 'food_log',
 ] as const;
 export type DailySource = (typeof DAILY_SOURCES)[number];
 /** Back-compat alias. */
@@ -370,6 +435,11 @@ export class GarminStore {
 				low_bpm REAL,
 				PRIMARY KEY (activity_id, zone)
 			);
+			CREATE TABLE IF NOT EXISTS garmin_food_entries (
+				log_id TEXT PRIMARY KEY,
+				${colsSql(FOOD_ENTRY_COLUMNS)}
+			);
+			CREATE INDEX IF NOT EXISTS idx_garmin_food_entries_date ON garmin_food_entries(date);
 			CREATE TABLE IF NOT EXISTS garmin_snapshots (
 				kind TEXT PRIMARY KEY,
 				json TEXT,
@@ -391,6 +461,7 @@ export class GarminStore {
 		this.migrate('garmin_daily_raw', { gz: 'BLOB' as ColType, error: 'TEXT' });
 		this.migrate('garmin_activity_laps', LAP_COLUMNS);
 		this.migrate('garmin_activity_sets', SET_COLUMNS);
+		this.migrate('garmin_food_entries', FOOD_ENTRY_COLUMNS);
 	}
 
 	private migrate(table: string, columns: Record<string, string>): void {
@@ -459,12 +530,44 @@ export class GarminStore {
 				const zipped = GZ_DAILY_SOURCES.has(source);
 				rawStmt.run(date, source, zipped || value == null ? null : JSON.stringify(value), zipped ? gz(value) : null, errors[source] ?? null);
 			}
+			if ('food_log' in raw && !errors.food_log) this.replaceFoodEntries(date, raw.food_log);
 			for (const [metric, points] of Object.entries(intraday)) {
 				if (!Array.isArray(points) || !points.length) continue;
 				delIntra.run(date, metric);
 				for (const [ts, value] of points) insIntra.run(date, metric, Math.trunc(ts), value);
 			}
 		})();
+	}
+
+	private replaceFoodEntries(date: string, log: unknown): void {
+		const cols = Object.keys(FOOD_ENTRY_COLUMNS);
+		this.db.prepare('DELETE FROM garmin_food_entries WHERE date = ?').run(date);
+		const stmt = this.db.prepare(`INSERT OR REPLACE INTO garmin_food_entries (log_id, ${cols.join(', ')}) VALUES (?, ${cols.map(() => '?').join(', ')})`);
+		for (const e of parseFoodLog(date, log)) stmt.run(e.log_id, ...cols.map(c => cell(e[c])));
+	}
+
+	/**
+	 * Store a freshly read food log for one date (after a nutrition write) without
+	 * touching the day's other metrics.
+	 */
+	upsertFoodLog(date: string, log: unknown, totals: Record<string, unknown>): void {
+		this.db.transaction(() => {
+			this.db.prepare('INSERT OR REPLACE INTO garmin_daily_raw (date, source, json, gz, error, synced_at) VALUES (?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP)').run(
+				date,
+				'food_log',
+				log == null ? null : JSON.stringify(log)
+			);
+			this.replaceFoodEntries(date, log);
+			this.db.prepare('INSERT OR IGNORE INTO garmin_daily (date) VALUES (?)').run(date);
+			this.db.prepare(`UPDATE garmin_daily SET ${FOOD_DAILY_COLUMNS.map(c => `${c} = ?`).join(', ')} WHERE date = ?`).run(
+				...FOOD_DAILY_COLUMNS.map(c => cell(totals[c])),
+				date
+			);
+		})();
+	}
+
+	getFoodEntries(date: string): FoodEntry[] {
+		return this.db.prepare('SELECT * FROM garmin_food_entries WHERE date = ? ORDER BY meal_time, logged_at').all(date) as FoodEntry[];
 	}
 
 	getDaily(date: string): GarminDailyRow | null {
