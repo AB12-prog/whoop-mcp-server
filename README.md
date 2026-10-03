@@ -61,6 +61,7 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `LOCAL_TIMEZONE` | optional | Default `Australia/Brisbane` (defines "today") |
 | `GARMIN_CALL_GAP_S` | optional | Pause between Garmin calls inside one fetch (default `0.4`) |
 | `GARMIN_MAX_CHART` | optional | Max time-series points per activity (default `4000`) |
+| `GARMIN_QUERY_TIMEOUT_MS` | optional | Hard limit for one `garmin_query` (default `15000`); queries run in a separate, killable process |
 | `GARMIN_RATE_LIMIT_WAITS_MIN` | optional | Backfill back-off schedule in minutes (default `10,20,40`) |
 | `GARMIN_NUTRITION_REGION` / `GARMIN_NUTRITION_LANGUAGE` | optional | Region/language sent with new custom foods and log entries when search didn't supply one (default `US` / `en`, as in garmin_mcp) |
 | `WHOOP_SYNC` | optional | `on` resumes automatic WHOOP pulls |

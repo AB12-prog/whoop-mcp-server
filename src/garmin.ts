@@ -8,9 +8,10 @@
 // all persistence: the bridge never writes to disk, and Garmin tokens are kept
 // AES-GCM encrypted in SQLite alongside the WHOOP archive.
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { fork, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import Database from 'better-sqlite3';
@@ -331,6 +332,10 @@ export type ActivitySource = (typeof ACTIVITY_SOURCES)[number];
 export const INTRADAY_METRICS = ['hr', 'stress', 'body_battery', 'respiration', 'spo2', 'spo2_hourly', 'steps', 'hrv', 'sleep_stage'] as const;
 export type IntradayMetric = (typeof INTRADAY_METRICS)[number];
 
+/** Child-process script that executes garmin_query SQL (see query-runner.ts). */
+const QUERY_RUNNER = fileURLToPath(new URL('./query-runner.js', import.meta.url));
+const QUERY_TIMEOUT_MS = Number(process.env.GARMIN_QUERY_TIMEOUT_MS ?? 15_000);
+
 /** Tables the read-only query tool must never touch (credentials). */
 const PRIVATE_TABLES = /\b(tokens|garmin_account|oauth_[a-z_]+)\b/i;
 
@@ -361,7 +366,6 @@ export interface ActivityDetailResponse {
 
 export class GarminStore {
 	private readonly db: Database.Database;
-	private ro: Database.Database | null = null;
 
 	constructor(private readonly dbPath: string) {
 		this.db = new Database(dbPath);
@@ -525,12 +529,12 @@ export class GarminStore {
 		this.db.transaction(() => {
 			stmt.run(date, ...cols.map(c => cell(norm[c])), Object.keys(errors).length ? JSON.stringify(errors) : null);
 			for (const source of DAILY_SOURCES) {
-				if (!(source in raw)) continue; // not fetched this time — keep what's stored
+				if (!Object.hasOwn(raw, source)) continue; // not fetched this time — keep what's stored
 				const value = raw[source];
 				const zipped = GZ_DAILY_SOURCES.has(source);
 				rawStmt.run(date, source, zipped || value == null ? null : JSON.stringify(value), zipped ? gz(value) : null, errors[source] ?? null);
 			}
-			if ('food_log' in raw && !errors.food_log) this.replaceFoodEntries(date, raw.food_log);
+			if (Object.hasOwn(raw, 'food_log') && !errors.food_log) this.replaceFoodEntries(date, raw.food_log);
 			for (const [metric, points] of Object.entries(intraday)) {
 				if (!Array.isArray(points) || !points.length) continue;
 				delIntra.run(date, metric);
@@ -659,7 +663,7 @@ export class GarminStore {
 
 	upsertActivityDetail(res: ActivityDetailResponse): void {
 		const id = res.activity_id;
-		const extras = Object.entries(res.extras).filter(([k, v]) => k in ACTIVITY_COLUMNS && v != null);
+		const extras = Object.entries(res.extras).filter(([k, v]) => Object.hasOwn(ACTIVITY_COLUMNS, k) && v != null);
 		const lapCols = Object.keys(LAP_COLUMNS);
 		const setCols = Object.keys(SET_COLUMNS);
 		this.db.transaction(() => {
@@ -763,35 +767,40 @@ export class GarminStore {
 	}
 
 	/**
-	 * Run one read-only SELECT on a separate read-only connection. Credential
-	 * tables are refused; at most `maxRows` rows come back.
+	 * Run one read-only SELECT in a short-lived child process (read-only
+	 * connection, hard timeout, memory cap) so a runaway query can't freeze the
+	 * server. Credential tables are refused; at most `maxRows` rows come back.
 	 */
-	readonlyQuery(sql: string, maxRows: number): { columns: string[]; rows: unknown[][]; truncated: boolean } {
+	readonlyQuery(sql: string, maxRows: number, timeoutMs = QUERY_TIMEOUT_MS): Promise<{ columns: string[]; rows: unknown[][]; truncated: boolean }> {
 		const trimmed = sql.trim().replace(/;\s*$/, '');
-		if (!/^(select|with)\b/i.test(trimmed)) throw new Error('Only a single SELECT (or WITH … SELECT) statement is allowed.');
-		if (PRIVATE_TABLES.test(trimmed)) throw new Error('That table holds credentials and is not queryable.');
-		if (/\b(attach|detach|pragma|load_extension)\b/i.test(trimmed)) throw new Error('ATTACH, PRAGMA and extensions are not allowed.');
-		if (!this.ro) {
-			this.ro = new Database(this.dbPath, { readonly: true, fileMustExist: true });
-			this.ro.pragma('busy_timeout = 5000');
-			this.ro.function('gunzip_json', { deterministic: true }, (blob: unknown) =>
-				Buffer.isBuffer(blob) ? gunzipSync(blob).toString('utf8') : null
+		if (!/^(select|with)\b/i.test(trimmed)) return Promise.reject(new Error('Only a single SELECT (or WITH … SELECT) statement is allowed.'));
+		if (PRIVATE_TABLES.test(trimmed)) return Promise.reject(new Error('That table holds credentials and is not queryable.'));
+		if (/\b(attach|detach|pragma|load_extension)\b/i.test(trimmed)) return Promise.reject(new Error('ATTACH, PRAGMA and extensions are not allowed.'));
+		return new Promise((resolve, reject) => {
+			const child = fork(QUERY_RUNNER, [], {
+				execArgv: ['--max-old-space-size=256'],
+				serialization: 'advanced',
+				stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+			});
+			let settled = false;
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				if (child.exitCode === null) child.kill('SIGKILL');
+				fn();
+			};
+			const timer = setTimeout(
+				() => finish(() => reject(new Error(`Query stopped after ${Math.round(timeoutMs / 1000)} s — narrow it (filter by date, avoid unbounded recursion).`))),
+				timeoutMs
 			);
-		}
-		const stmt = this.ro.prepare(trimmed);
-		if (!stmt.reader || !stmt.readonly) throw new Error('Only read-only queries that return rows are allowed.');
-		stmt.raw(true);
-		const columns = stmt.columns().map(c => c.name);
-		const rows: unknown[][] = [];
-		let truncated = false;
-		for (const row of stmt.iterate() as IterableIterator<unknown[]>) {
-			if (rows.length >= maxRows) {
-				truncated = true;
-				break;
-			}
-			rows.push(row.map(v => (Buffer.isBuffer(v) ? `<${v.length} bytes gzip — wrap in gunzip_json()>` : v)));
-		}
-		return { columns, rows, truncated };
+			child.once('message', (msg: { ok: boolean; error?: string; columns?: string[]; rows?: unknown[][]; truncated?: boolean }) =>
+				finish(() => (msg.ok ? resolve({ columns: msg.columns ?? [], rows: msg.rows ?? [], truncated: Boolean(msg.truncated) }) : reject(new Error(msg.error ?? 'query failed'))))
+			);
+			child.once('error', err => finish(() => reject(err)));
+			child.once('exit', code => finish(() => reject(new Error(`Query process exited (${code ?? 'killed'}) — the result may have been too large.`))));
+			child.send({ dbPath: this.dbPath, sql: trimmed, maxRows });
+		});
 	}
 
 	// ---- sync state --------------------------------------------------------
@@ -821,7 +830,6 @@ export class GarminStore {
 	}
 
 	close(): void {
-		this.ro?.close();
 		this.db.close();
 	}
 }

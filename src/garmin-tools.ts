@@ -250,7 +250,7 @@ export async function handleGarminTool(
 		const sql = String(args.sql ?? '');
 		const limit = clampInt(args.limit, 500, 1, 5000);
 		try {
-			const r = store.readonlyQuery(sql, limit);
+			const r = await store.readonlyQuery(sql, limit);
 			return capped(JSON.stringify({ columns: r.columns, rows: r.rows, returned: r.rows.length, truncated: r.truncated }));
 		} catch (err) {
 			return text(`Query failed: ${err instanceof Error ? err.message : String(err)}`, true);
