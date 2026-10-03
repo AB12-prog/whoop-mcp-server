@@ -1,9 +1,16 @@
-FROM node:20-slim
+FROM node:22-trixie-slim
 
 WORKDIR /app
 
-# Install dependencies for better-sqlite3
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+# Build tools for better-sqlite3, plus Python (3.13 on trixie) for the Garmin bridge
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends python3 python3-venv make g++ ca-certificates tzdata \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Garmin bridge dependencies in an isolated venv
+COPY garmin/requirements.txt ./garmin/requirements.txt
+RUN python3 -m venv /opt/garmin \
+	&& /opt/garmin/bin/pip install --no-cache-dir -r garmin/requirements.txt
 
 # Copy package files
 COPY package*.json ./
@@ -14,6 +21,7 @@ RUN npm ci
 # Copy source files
 COPY tsconfig.json ./
 COPY src ./src
+COPY garmin ./garmin
 
 # Build TypeScript
 RUN npm run build
@@ -24,6 +32,7 @@ RUN mkdir -p /data
 ENV DB_PATH=/data/whoop.db
 ENV MCP_MODE=http
 ENV PORT=3000
+ENV GARMIN_PYTHON=/opt/garmin/bin/python
 
 EXPOSE 3000
 

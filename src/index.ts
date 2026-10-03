@@ -3,11 +3,17 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { timingSafeEqual } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response } from 'express';
 import { WhoopClient, WhoopAuthError } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
-import { mountOAuthProxy } from './oauth-proxy.js';
+import { mountOAuthProxy, LoginError, type LoginProvider } from './oauth-proxy.js';
+import { GarminBridge, GarminBridgeError, GarminStore, GarminSync, type GarminAccount } from './garmin.js';
+import { garminToolDefs, GARMIN_TOOL_NAMES, handleGarminTool } from './garmin-tools.js';
+import { garminWriteToolDefs, GARMIN_WRITE_TOOL_NAMES, handleGarminWriteTool } from './garmin-write-tools.js';
 
 interface ToolArguments {
 	days?: number;
@@ -21,6 +27,11 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
+	// WHOOP is a read-only archive. Set WHOOP_SYNC=on to resume automatic WHOOP
+	// pulls (e.g. while a membership is still active); whoop_sync always works
+	// manually as long as the stored WHOOP grant is alive.
+	whoopAutoSync: (process.env.WHOOP_SYNC ?? 'off').toLowerCase() === 'on',
+	baseUrl: (process.env.BASE_URL ?? '').replace(/\/+$/, ''),
 };
 
 const db = new WhoopDatabase(config.dbPath);
@@ -38,6 +49,93 @@ if (existingTokens) {
 }
 
 const sync = new WhoopSync(client, db);
+
+// ---- Garmin --------------------------------------------------------------
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const garminStore = new GarminStore(config.dbPath);
+const garminBridge = new GarminBridge({
+	python: process.env.GARMIN_PYTHON ?? (existsSync('/opt/garmin/bin/python') ? '/opt/garmin/bin/python' : 'python3'),
+	script: process.env.GARMIN_BRIDGE_PATH ?? path.resolve(here, '..', 'garmin', 'bridge.py'),
+	onTokens: tokens => garminStore.saveTokens(tokens),
+	loadTokens: () => garminStore.getTokens(),
+});
+const garminSync = new GarminSync(garminBridge, garminStore);
+
+// Which Garmin account may own this server: an explicit profile id, else the
+// account already bound, else (first sign-in only) the owner's email. With none
+// of these configured, sign-in fails closed rather than binding to whoever
+// reaches the page first.
+function expectedGarminProfileId(): number | null {
+	const env = Number.parseInt(process.env.GARMIN_ALLOWED_PROFILE_ID ?? '', 10);
+	if (Number.isFinite(env)) return env;
+	return garminStore.getAccount()?.profile_id ?? null;
+}
+
+function checkOwnerEmail(email: string): void {
+	const ownerEmail = (process.env.GARMIN_OWNER_EMAIL ?? '').trim().toLowerCase();
+	if (expectedGarminProfileId() != null) {
+		// Already bound: the bridge enforces the profile id. The email check
+		// still applies if configured, as a cheap early reject.
+		if (ownerEmail && email.toLowerCase() !== ownerEmail) throw new LoginError("That Garmin account isn't the one this server belongs to.");
+		return;
+	}
+	if (!ownerEmail) {
+		throw new LoginError('Server not set up yet: set GARMIN_OWNER_EMAIL in Railway, redeploy, then sign in.');
+	}
+	if (email.toLowerCase() !== ownerEmail) throw new LoginError("That Garmin account isn't the one this server belongs to.");
+}
+
+function garminLoginError(err: unknown): never {
+	if (err instanceof LoginError) throw err;
+	if (err instanceof GarminBridgeError) {
+		const messages: Record<string, string> = {
+			auth: "Garmin didn't accept that email and password.",
+			wrong_account: "That Garmin account isn't the one this server belongs to.",
+			bad_code: "That code didn't work. Check it and try again.",
+			expired: 'That sign-in expired. Start again.',
+			rate_limited: 'Garmin is limiting sign-ins right now. Wait a few minutes and try again.',
+		};
+		console.error('[garmin] sign-in failed:', err.code, err.message);
+		throw new LoginError(messages[err.code] ?? "Couldn't reach Garmin. Try again shortly.");
+	}
+	throw err;
+}
+
+function onGarminSignedIn(account: GarminAccount | undefined): void {
+	if (account && garminStore.getAccount() == null) {
+		garminStore.bindAccount(account);
+		console.log('[garmin] server bound to Garmin profile', account.profile_id);
+	}
+	// Pull recent data straight away so the first questions have answers.
+	garminSync.smartSync().catch(e => console.error('[garmin] post-login sync failed:', e instanceof Error ? e.message : e));
+}
+
+const garminLogin: LoginProvider = {
+	async login(email, password) {
+		checkOwnerEmail(email);
+		try {
+			const res = await garminBridge.call<{ status: string; pending_id?: string; account?: GarminAccount }>(
+				'/login',
+				{ email, password, expected_profile_id: expectedGarminProfileId() },
+				180_000
+			);
+			if (res.status === 'mfa_required' && res.pending_id) return { status: 'mfa_required', pendingId: res.pending_id };
+			onGarminSignedIn(res.account);
+			return { status: 'ok' };
+		} catch (err) {
+			garminLoginError(err);
+		}
+	},
+	async verifyMfa(pendingId, code) {
+		try {
+			const res = await garminBridge.call<{ account?: GarminAccount }>('/login/mfa', { pending_id: pendingId, code }, 120_000);
+			onGarminSignedIn(res.account);
+		} catch (err) {
+			garminLoginError(err);
+		}
+	},
+};
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
@@ -95,58 +193,43 @@ function validateBoolean(value: unknown): boolean {
 	return false;
 }
 
+const ARCHIVE_NOTE = 'WHOOP archive (read-only; WHOOP was worn until late Sep 2026 — use the garmin_* tools for current data).';
+
 function createMcpServer(): Server {
 	const server = new Server(
-		{ name: 'whoop-mcp-server', version: '1.0.0' },
+		{ name: 'health-mcp-server', version: '2.0.0' },
 		{ capabilities: { tools: {} } }
 	);
 
+	const daysProp = { days: { type: 'number', description: 'Days back from today (default: 14, max: 3650)' } };
+
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({
 		tools: [
+			...garminToolDefs,
+			...garminWriteToolDefs,
 			{
-				name: 'get_today',
-				description: "Get today's Whoop data including recovery score, last night's sleep, and current strain.",
+				name: 'whoop_latest',
+				description: `${ARCHIVE_NOTE} Last recorded WHOOP recovery, sleep and strain.`,
 				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
 			{
-				name: 'get_recovery_trends',
-				description: 'Get recovery score trends over time, including HRV and resting heart rate patterns.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
-					required: [],
-				},
+				name: 'whoop_recovery_trends',
+				description: `${ARCHIVE_NOTE} Recovery score, HRV and resting HR by day.`,
+				inputSchema: { type: 'object', properties: daysProp, required: [] },
 			},
 			{
-				name: 'get_sleep_analysis',
-				description: 'Get detailed sleep analysis including duration, stages, efficiency, and sleep debt.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
-					required: [],
-				},
+				name: 'whoop_sleep_analysis',
+				description: `${ARCHIVE_NOTE} Sleep duration, performance and efficiency by night.`,
+				inputSchema: { type: 'object', properties: daysProp, required: [] },
 			},
 			{
-				name: 'get_strain_history',
-				description: 'Get training strain history and workout data.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } },
-					required: [],
-				},
+				name: 'whoop_strain_history',
+				description: `${ARCHIVE_NOTE} Daily strain and calories.`,
+				inputSchema: { type: 'object', properties: daysProp, required: [] },
 			},
 			{
-				name: 'sync_data',
-				description: 'Manually trigger a data sync from Whoop.',
-				inputSchema: {
-					type: 'object',
-					properties: { full: { type: 'boolean', description: 'Run a full historical backfill of your entire WHOOP account, as far back as the data goes (default: false)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_records',
-				description: 'Return full raw records (every stored field) for a data type over a time window, as JSON, for detailed analysis. Use this instead of the summary tools when you need fields like sleep stages, SpO2, skin temp, respiratory rate, sleep debt, disturbances, or workout HR-zone durations.',
+				name: 'whoop_records',
+				description: `${ARCHIVE_NOTE} Full raw WHOOP records as JSON (sleep stages, SpO2, skin temp, respiratory rate, sleep debt, disturbances, workout HR zones).`,
 				inputSchema: {
 					type: 'object',
 					properties: {
@@ -158,14 +241,18 @@ function createMcpServer(): Server {
 				},
 			},
 			{
-				name: 'get_profile',
-				description: "Return the user's WHOOP profile (name, email) and latest body measurement (height, weight, max heart rate).",
+				name: 'whoop_profile',
+				description: `${ARCHIVE_NOTE} Stored WHOOP profile and last body measurement (height, weight, max HR).`,
 				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
 			{
-				name: 'get_auth_url',
-				description: 'Get the Whoop authorization URL to connect your account.',
-				inputSchema: { type: 'object', properties: {}, required: [] },
+				name: 'whoop_sync',
+				description: 'Pull any remaining data from WHOOP into the archive while the WHOOP grant still works. full=true re-pulls the entire history.',
+				inputSchema: {
+					type: 'object',
+					properties: { full: { type: 'boolean', description: 'Re-pull the entire WHOOP history (default: false)' } },
+					required: [],
+				},
 			},
 		],
 	}));
@@ -175,36 +262,51 @@ function createMcpServer(): Server {
 		const typedArgs = (args ?? {}) as ToolArguments;
 
 		try {
-			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history'];
-			if (dataTools.includes(name)) {
+			if (GARMIN_WRITE_TOOL_NAMES.has(name)) {
+				return await handleGarminWriteTool(name, (args ?? {}) as Record<string, unknown>, {
+					bridge: garminBridge,
+					sync: garminSync,
+					baseUrl: config.baseUrl,
+				});
+			}
+
+			if (GARMIN_TOOL_NAMES.has(name)) {
+				return await handleGarminTool(name, (args ?? {}) as Record<string, unknown>, {
+					store: garminStore,
+					sync: garminSync,
+					baseUrl: config.baseUrl,
+				});
+			}
+
+			// Archive reads serve stored data. Only when WHOOP_SYNC=on do they
+			// refresh from WHOOP first (a lapsed membership would just error).
+			const archiveReads = ['whoop_latest', 'whoop_recovery_trends', 'whoop_sleep_analysis', 'whoop_strain_history', 'whoop_records'];
+			if (config.whoopAutoSync && archiveReads.includes(name)) {
 				const tokens = db.getTokens();
-				if (!tokens) {
-					return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Use get_auth_url to authorize first.' }] };
-				}
-				client.setTokens(tokens);
-				try {
-					await sync.smartSync();
-				} catch (err) {
-					// Continue with cached data, but leave a trace — silent failures
-					// here previously hid a dying WHOOP grant for a whole day.
-					console.error('[sync] pre-tool sync failed; serving cached data:', err instanceof Error ? err.message : err);
+				if (tokens) {
+					client.setTokens(tokens);
+					try {
+						await sync.smartSync();
+					} catch (err) {
+						console.error('[whoop] pre-tool sync failed; serving archive:', err instanceof Error ? err.message : err);
+					}
 				}
 			}
 
 			switch (name) {
-				case 'get_today': {
+				case 'whoop_latest': {
 					const recovery = db.getLatestRecovery();
 					const sleep = db.getLatestSleep();
 					const cycle = db.getLatestCycle();
 
 					if (!recovery && !sleep && !cycle) {
-						return { content: [{ type: 'text', text: 'No data available. Try running sync_data first.' }] };
+						return { content: [{ type: 'text', text: 'The WHOOP archive is empty.' }] };
 					}
 
-					let response = "# Today's Whoop Summary\n\n";
+					let response = '# Latest WHOOP data (archive)\n\n';
 
 					if (recovery) {
-						response += `## Recovery: ${recovery.recovery_score ?? 'N/A'}% ${recovery.recovery_score ? getRecoveryZone(recovery.recovery_score) : ''}\n`;
+						response += `## Recovery (${formatDate(recovery.created_at)}): ${recovery.recovery_score ?? 'N/A'}% ${recovery.recovery_score ? getRecoveryZone(recovery.recovery_score) : ''}\n`;
 						response += `- **HRV**: ${recovery.hrv_rmssd?.toFixed(1) ?? 'N/A'} ms\n`;
 						response += `- **Resting HR**: ${recovery.resting_hr ?? 'N/A'} bpm\n`;
 						if (recovery.spo2) response += `- **SpO2**: ${recovery.spo2.toFixed(1)}%\n`;
@@ -214,7 +316,7 @@ function createMcpServer(): Server {
 
 					if (sleep) {
 						const totalSleep = (sleep.total_in_bed_milli ?? 0) - (sleep.total_awake_milli ?? 0);
-						response += `## Last Night's Sleep\n`;
+						response += `## Sleep (${formatDate(sleep.start_time)})\n`;
 						response += `- **Total Sleep**: ${formatDuration(totalSleep)}\n`;
 						response += `- **Performance**: ${sleep.sleep_performance?.toFixed(0) ?? 'N/A'}%\n`;
 						response += `- **Efficiency**: ${sleep.sleep_efficiency?.toFixed(0) ?? 'N/A'}%\n`;
@@ -224,25 +326,23 @@ function createMcpServer(): Server {
 					}
 
 					if (cycle) {
-						response += `## Current Strain\n`;
+						response += `## Strain (${formatDate(cycle.start_time)})\n`;
 						response += `- **Day Strain**: ${cycle.strain?.toFixed(1) ?? 'N/A'} ${cycle.strain ? getStrainZone(cycle.strain) : ''}\n`;
 						if (cycle.kilojoule) response += `- **Calories**: ${Math.round(cycle.kilojoule / 4.184)} kcal\n`;
-						if (cycle.avg_hr) response += `- **Avg HR**: ${cycle.avg_hr} bpm\n`;
-						if (cycle.max_hr) response += `- **Max HR**: ${cycle.max_hr} bpm\n`;
 					}
 
 					return { content: [{ type: 'text', text: response }] };
 				}
 
-				case 'get_recovery_trends': {
+				case 'whoop_recovery_trends': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getRecoveryTrends(days);
 
 					if (trends.length === 0) {
-						return { content: [{ type: 'text', text: 'No recovery data available for the requested period.' }] };
+						return { content: [{ type: 'text', text: 'No WHOOP recovery data in that window.' }] };
 					}
 
-					let response = `# Recovery Trends (Last ${days} Days)\n\n`;
+					let response = `# WHOOP Recovery (archive, last ${days} days)\n\n`;
 					response += '| Date | Recovery | HRV | RHR |\n|------|----------|-----|-----|\n';
 
 					for (const day of trends) {
@@ -258,15 +358,15 @@ function createMcpServer(): Server {
 					return { content: [{ type: 'text', text: response }] };
 				}
 
-				case 'get_sleep_analysis': {
+				case 'whoop_sleep_analysis': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getSleepTrends(days);
 
 					if (trends.length === 0) {
-						return { content: [{ type: 'text', text: 'No sleep data available for the requested period.' }] };
+						return { content: [{ type: 'text', text: 'No WHOOP sleep data in that window.' }] };
 					}
 
-					let response = `# Sleep Analysis (Last ${days} Days)\n\n`;
+					let response = `# WHOOP Sleep (archive, last ${days} days)\n\n`;
 					response += '| Date | Duration | Performance | Efficiency |\n|------|----------|-------------|------------|\n';
 
 					for (const day of trends) {
@@ -282,15 +382,15 @@ function createMcpServer(): Server {
 					return { content: [{ type: 'text', text: response }] };
 				}
 
-				case 'get_strain_history': {
+				case 'whoop_strain_history': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getStrainTrends(days);
 
 					if (trends.length === 0) {
-						return { content: [{ type: 'text', text: 'No strain data available for the requested period.' }] };
+						return { content: [{ type: 'text', text: 'No WHOOP strain data in that window.' }] };
 					}
 
-					let response = `# Strain History (Last ${days} Days)\n\n`;
+					let response = `# WHOOP Strain (archive, last ${days} days)\n\n`;
 					response += '| Date | Strain | Calories |\n|------|--------|----------|\n';
 
 					for (const day of trends) {
@@ -305,55 +405,32 @@ function createMcpServer(): Server {
 					return { content: [{ type: 'text', text: response }] };
 				}
 
-				case 'sync_data': {
+				case 'whoop_sync': {
 					const tokens = db.getTokens();
 					if (!tokens) {
-						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
+						return { content: [{ type: 'text', text: 'No WHOOP grant stored, so nothing more can be pulled. The archive is still readable.' }] };
 					}
 					client.setTokens(tokens);
 
-					const full = validateBoolean(typedArgs.full);
-
-					if (full) {
+					if (validateBoolean(typedArgs.full)) {
 						// A full backfill pages through the entire account and can take a
-						// few minutes, so run it in the background and return right away
-						// rather than holding the tool call open until it times out.
+						// few minutes, so run it in the background and return right away.
 						sync.syncAll()
-							.then(s => console.log('[sync] full backfill complete', s))
-							.catch(e => console.error('[sync] full backfill failed', e instanceof Error ? e.message : e));
-						return {
-							content: [{
-								type: 'text',
-								text: 'Full historical backfill started in the background. It pulls your entire WHOOP history and usually takes a couple of minutes. Give it a moment, then ask for whatever you want to look at — once it finishes, queries and analysis cover your full history.',
-							}],
-						};
+							.then(s => console.log('[whoop] full backfill complete', s))
+							.catch(e => console.error('[whoop] full backfill failed', e instanceof Error ? e.message : e));
+						return { content: [{ type: 'text', text: 'Full WHOOP re-pull started in the background (a couple of minutes).' }] };
 					}
 
-					const result = await sync.smartSync();
-					if (result.type === 'skip') {
-						return { content: [{ type: 'text', text: 'Data is already up to date (synced within the last hour).' }] };
-					}
-					const stats = result.stats;
+					const stats = await sync.quickSync();
 					return {
 						content: [{
 							type: 'text',
-							text: `Sync complete!\n- Cycles: ${stats?.cycles}\n- Recoveries: ${stats?.recoveries}\n- Sleeps: ${stats?.sleeps}\n- Workouts: ${stats?.workouts}`,
+							text: `WHOOP sync complete (last 7 days):\n- Cycles: ${stats.cycles}\n- Recoveries: ${stats.recoveries}\n- Sleeps: ${stats.sleeps}\n- Workouts: ${stats.workouts}`,
 						}],
 					};
 				}
 
-				case 'get_records': {
-					const tokens = db.getTokens();
-					if (!tokens) {
-						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
-					}
-					client.setTokens(tokens);
-					try {
-						await sync.smartSync();
-					} catch {
-						// Continue with cached data
-					}
-
+				case 'whoop_records': {
 					const type = String((typedArgs as { type?: string }).type ?? '');
 					const days = validateDays(typedArgs.days);
 					const rawLimit = (typedArgs as { limit?: number }).limit;
@@ -380,55 +457,22 @@ function createMcpServer(): Server {
 							rows = db.getWorkoutsByDateRange(startIso, endIso) as unknown as Array<Record<string, unknown>>;
 							break;
 						default:
-							return { content: [{ type: 'text', text: "Invalid type. Use one of: recovery, sleep, cycles, workouts." }] };
+							return { content: [{ type: 'text', text: 'Invalid type. Use one of: recovery, sleep, cycles, workouts.' }] };
 					}
 
 					const total = rows.length;
 					const truncated = total > limit;
 					const out = truncated ? rows.slice(0, limit) : rows;
-					const payload = {
-						type,
-						days,
-						returned: out.length,
-						total_in_window: total,
-						truncated,
-						records: out,
-					};
-					return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+					return { content: [{ type: 'text', text: JSON.stringify({ type, days, returned: out.length, total_in_window: total, truncated, records: out }) }] };
 				}
 
-				case 'get_profile': {
-					const tokens = db.getTokens();
-					if (!tokens) {
-						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Connect the Whoop connector first.' }] };
-					}
+				case 'whoop_profile': {
 					const profile = db.getProfile();
 					const body = db.getBodyMeasurement();
 					if (!profile && !body) {
-						return { content: [{ type: 'text', text: 'No profile or body measurement stored yet. Run sync_data first.' }] };
+						return { content: [{ type: 'text', text: 'No WHOOP profile stored.' }] };
 					}
 					return { content: [{ type: 'text', text: JSON.stringify({ profile, body_measurement: body }) }] };
-				}
-
-				case 'get_auth_url': {
-					// The /reauth flow registers its state in oauth_pending, which
-					// /callback requires. A raw getAuthorizationUrl() link can never
-					// complete: its state is unknown to /callback and gets rejected.
-					const base = (process.env.BASE_URL ?? '').replace(/\/+$/, '');
-					if (!base) {
-						return {
-							content: [{
-								type: 'text',
-								text: 'BASE_URL is not configured, so no re-authorization URL is available. In HTTP mode, set BASE_URL and visit /reauth on the server.',
-							}],
-						};
-					}
-					return {
-						content: [{
-							type: 'text',
-							text: `To (re)authorize WHOOP:\n\n1. Visit: ${base}/reauth\n2. Log in to WHOOP and approve access\n3. You'll see a confirmation once tokens are saved\n\nThis re-links the WHOOP account this server is bound to; scheduled syncs resume immediately after.`,
-						}],
-					};
 				}
 
 				default:
@@ -448,7 +492,7 @@ async function main(): Promise<void> {
 		const server = createMcpServer();
 		const transport = new StdioServerTransport();
 		await server.connect(transport);
-		process.stderr.write('Whoop MCP server running on stdio\n');
+		process.stderr.write('Health MCP server running on stdio\n');
 	} else {
 		const app = express();
 		app.use(express.json());
@@ -463,51 +507,30 @@ async function main(): Promise<void> {
 			app,
 			dbPath: config.dbPath,
 			baseUrl,
-			whoopClientId: config.clientId,
-			whoopRedirectUri: config.redirectUri,
-			exchangeAndSaveWhoopCode: async (code: string) => {
-				// Any WHOOP account can complete the proxied login, but this server
-				// stores exactly one user's data. Verify the account that just logged
-				// in is the account this server is bound to before persisting anything,
-				// otherwise a stranger connecting their own WHOOP account would (a)
-				// overwrite the owner's tokens and (b) get an MCP token that reads the
-				// owner's stored health history.
-				const previousTokens = db.getTokens();
-				try {
-					const tokens = await client.exchangeCodeForTokens(code);
-					const profile = await client.getProfile();
-
-					const allowedUserId = (process.env.WHOOP_ALLOWED_USER_ID ?? '').trim();
-					const storedProfile = db.getProfile();
-					if (allowedUserId && String(profile.user_id) !== allowedUserId) {
-						throw new Error(`WHOOP user ${profile.user_id} is not the allowed user for this server`);
-					}
-					if (!allowedUserId && storedProfile?.user_id != null && storedProfile.user_id !== profile.user_id) {
-						throw new Error(`WHOOP user ${profile.user_id} does not match the account this server is bound to`);
-					}
-
-					db.saveTokens(tokens);
-					db.saveProfile(profile);
-					sync.syncDays(90).catch(() => {});
-				} catch (err) {
-					// Don't leave the rejected login's tokens on the shared client.
-					if (previousTokens) {
-						client.setTokens(previousTokens);
-					} else {
-						client.clearTokens();
-					}
-					throw err;
-				}
-			},
+			loginProvider: garminLogin,
 		});
 
+		// Start the Garmin sidecar now so the first tool call doesn't pay for it.
+		garminBridge.warmUp();
+
 		app.get('/health', (_req: Request, res: Response) => {
-			// token_updated_at is the last successful rotation's save time — if the
-			// grant dies, it pins down when the last good refresh happened.
+			const garminState = garminStore.getSyncState();
+			const account = garminStore.getAccount();
 			res.json({
 				status: 'ok',
-				authenticated: Boolean(db.getTokens()),
-				token_updated_at: db.getTokenUpdatedAt(),
+				garmin: {
+					connected: garminSync.isConnected(),
+					bound: Boolean(account),
+					tokens_updated_at: account?.tokens_updated_at ?? null,
+					last_sync_at: garminState.last_sync_at,
+					stored_range: [garminState.oldest_date, garminState.newest_date],
+					last_error: garminState.last_error,
+				},
+				whoop: {
+					mode: config.whoopAutoSync ? 'syncing' : 'archive',
+					grant_stored: Boolean(db.getTokens()),
+					token_updated_at: db.getTokenUpdatedAt(),
+				},
 			});
 		});
 
@@ -530,25 +553,44 @@ async function main(): Promise<void> {
 				res.status(401).json({ error: 'unauthorized' });
 				return;
 			}
-			try {
-				const result = await sync.smartSync();
-				res.json({ ok: true, ...result });
-			} catch (err) {
-				console.error('[sync] error', err);
-				const detail = err instanceof Error ? err.message : String(err);
-				// Put the real reason in the response: the cron runner prints the
-				// body, so its logs say what broke instead of a bare "sync failed".
-				if (err instanceof WhoopAuthError) {
-					res.status(401).json({
-						ok: false,
-						error: 'whoop auth expired',
-						detail,
-						action: `re-authorize at ${baseUrl}/reauth`,
-					});
-				} else {
-					res.status(500).json({ ok: false, error: 'sync failed', detail });
+
+			// Put the real reason in the response: the cron runner prints the
+			// body, so its logs say what broke instead of a bare "sync failed".
+			const result: Record<string, unknown> = {};
+			let ok = true;
+			let status = 200;
+
+			if (garminSync.backfillStatus().running) {
+				result.garmin = { type: 'skip', reason: 'backfill running' };
+			} else {
+				try {
+					result.garmin = await garminSync.smartSync();
+				} catch (err) {
+					ok = false;
+					const detail = err instanceof Error ? err.message : String(err);
+					console.error('[sync] garmin error', detail);
+					if (err instanceof GarminBridgeError && err.status === 401) {
+						status = 401;
+						result.garmin = { error: 'garmin session expired', detail, action: `sign in at ${baseUrl}/reauth` };
+					} else {
+						status = 500;
+						result.garmin = { error: 'garmin sync failed', detail };
+					}
 				}
 			}
+
+			if (config.whoopAutoSync) {
+				try {
+					result.whoop = await sync.smartSync();
+				} catch (err) {
+					// WHOOP is secondary now; report it without failing the run.
+					const detail = err instanceof Error ? err.message : String(err);
+					console.error('[sync] whoop error', detail);
+					result.whoop = { error: err instanceof WhoopAuthError ? 'whoop auth expired' : 'whoop sync failed', detail };
+				}
+			}
+
+			res.status(status).json({ ok, ...result });
 		});
 
 		app.all('/mcp', requireMcpAuth, async (req: Request, res: Response) => {
@@ -616,7 +658,7 @@ async function main(): Promise<void> {
 		});
 
 		const server = app.listen(config.port, '0.0.0.0', () => {
-			process.stdout.write(`Whoop MCP server running on http://0.0.0.0:${config.port}\n`);
+			process.stdout.write(`Health MCP server running on http://0.0.0.0:${config.port}\n`);
 		});
 
 		const shutdown = (): void => {
@@ -625,6 +667,8 @@ async function main(): Promise<void> {
 				session.transport.close().catch(() => {});
 			}
 			transports.clear();
+			garminBridge.stop();
+			garminStore.close();
 			db.close();
 			server.close(() => process.exit(0));
 		};

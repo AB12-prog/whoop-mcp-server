@@ -1,132 +1,63 @@
-# Whoop MCP Server
+# Health MCP Server (Garmin + WHOOP archive)
 
-A Model Context Protocol (MCP) server that connects your Whoop health data to Claude. Designed to be hosted remotely and used as a custom connector in Claude.ai.
+A remote Model Context Protocol server that gives Claude your Garmin Connect health data, plus a read-only archive of your historical WHOOP data. Hosted on Railway, used as a custom connector in Claude.ai.
 
-Built using the [Whoop Developer API v2](https://developer.whoop.com/docs/introduction).
+## How it works
 
-## Features
+- **Garmin** — Garmin's official Health API is partner-only, so this uses the unofficial Garmin Connect API via [python-garminconnect](https://github.com/cyberjunky/python-garminconnect), run as a localhost-only Python sidecar (`garmin/bridge.py`) supervised by the Node server. Unofficial means it can break when Garmin changes things; redeploying picks up library fixes (`garmin/requirements.txt` allows minor updates).
+- **WHOOP** — kept as a read-only archive in the same SQLite volume. No automatic WHOOP pulls unless `WHOOP_SYNC=on`.
+- **Sign-in** — the connector's OAuth flow shows a sign-in page on this server: Garmin email, password, and Garmin's verification code if MFA is on. The password is relayed to Garmin and never stored. The server binds to the first (owner) Garmin account and refuses any other.
+- **Writes** — workout and weigh-in tools are two-step: without `confirm: true` they validate and return a preview, saving nothing; Claude shows it, then confirms. Exercise names are matched to Garmin's catalogue (case/hyphen-insensitive); unclear names return choices rather than a guess.
+- **Storage** — Garmin tokens are AES-GCM encrypted in SQLite (same key as before). Daily metrics are stored normalised plus Garmin's raw JSON per source.
 
-- **Recovery Data**: Daily recovery scores, HRV, resting heart rate, SpO2, skin temperature
-- **Sleep Analysis**: Sleep duration, stages, efficiency, performance, respiratory rate
-- **Strain Tracking**: Daily strain scores, calories burned, heart rate zones
-- **Workout History**: All logged workouts with detailed metrics
-- **Auto-Sync**: Automatically keeps data fresh with smart sync logic
-- **90-Day History**: Maintains local cache of your health data for trend analysis
+## MCP tools
 
-## MCP Tools
+| Tool | What it returns |
+|---|---|
+| `garmin_today` | Readiness, last night's sleep + stages, HRV vs baseline, RHR, Body Battery, stress, steps, training status, today's activities |
+| `garmin_trends` | Day-by-day table + averages (readiness, HRV, RHR, sleep, Body Battery, stress, steps) |
+| `garmin_activities` | Activities with time, distance, HR, training effect, load |
+| `garmin_records` | Normalised rows as JSON (`daily` or `activities`) |
+| `garmin_raw` | Garmin's raw JSON for one date/source (`summary`, `sleep`, `hrv`, `readiness`, `training_status`) |
+| `garmin_sync` | Refresh now, or `days>7` for a paced background backfill |
+| `garmin_auth_url` | Link to reconnect Garmin |
+| `garmin_workouts` | Workout library + upcoming calendar entries (with ids) |
+| `garmin_create_strength_workout` | Build a strength workout (sets × reps @ kg, rest); optional schedule date / send to watch |
+| `garmin_create_run_workout` | Build a structured run (warmup/intervals/recovery/cooldown, pace or HR-zone targets, repeats) |
+| `garmin_schedule_workout` | Put a library workout on a calendar date |
+| `garmin_remove_workout` | Unschedule one date, or delete from the library |
+| `garmin_weigh_ins` | Weigh-ins (weight, BMI, body fat) |
+| `garmin_log_weight` / `garmin_delete_weight` | Add or remove a weigh-in |
+| `whoop_latest`, `whoop_recovery_trends`, `whoop_sleep_analysis`, `whoop_strain_history`, `whoop_records`, `whoop_profile` | WHOOP archive |
+| `whoop_sync` | Pull remaining WHOOP data while the WHOOP grant still works |
 
-| Tool | Description |
-|------|-------------|
-| `get_today` | Morning briefing with recovery, sleep, and strain |
-| `get_recovery_trends` | Recovery patterns over time with HRV/RHR |
-| `get_sleep_analysis` | Sleep quality trends and stage breakdowns |
-| `get_strain_history` | Training load and calorie trends |
-| `sync_data` | Manually trigger a data sync |
-| `get_auth_url` | Get authorization URL for Whoop connection |
+## Environment variables (Railway)
 
-## Setup
+| Variable | Required | Notes |
+|---|---|---|
+| `BASE_URL` | yes | Public URL, e.g. `https://…up.railway.app` |
+| `GARMIN_OWNER_EMAIL` | yes (first sign-in) | Your Garmin login email. Sign-in fails closed until set |
+| `GARMIN_ALLOWED_PROFILE_ID` | optional | Pin the owner by Garmin profile id instead |
+| `ENCRYPTION_SECRET` or `WHOOP_CLIENT_SECRET` | yes | Token encryption key — don't change it, or stored tokens become unreadable |
+| `SYNC_SECRET` | yes | Shared with the cron service (`trigger-sync.mjs`) |
+| `LOCAL_TIMEZONE` | optional | Default `Australia/Brisbane` (defines "today") |
+| `WHOOP_SYNC` | optional | `on` resumes automatic WHOOP pulls |
+| `WHOOP_CLIENT_ID`, `WHOOP_REDIRECT_URI` | optional | Only needed for `whoop_sync` |
 
-### 1. Create a Whoop Developer App
+Volume mounted at `/data` (`DB_PATH=/data/whoop.db`).
 
-1. Go to [developer.whoop.com](https://developer.whoop.com)
-2. Create a new application
-3. Note your **Client ID** and **Client Secret**
-4. Set the redirect URI to your deployed server's callback URL (e.g., `https://your-app.railway.app/callback`)
+## Endpoints
 
-### 2. Deploy to Railway
+- `/mcp` — MCP (Streamable HTTP, OAuth bearer)
+- `/reauth` — reconnect Garmin without touching the Claude connector
+- `/health` — Garmin connection/sync state and WHOOP archive state
+- `POST /sync` — hourly cron target (`x-sync-secret` header); syncs Garmin (and WHOOP if `WHOOP_SYNC=on`)
 
-1. Fork/push this repo to GitHub
-2. Create a new project on [Railway](https://railway.app)
-3. Connect your GitHub repo
-4. Add environment variables:
-   - `WHOOP_CLIENT_ID`: Your Whoop app client ID
-   - `WHOOP_CLIENT_SECRET`: Your Whoop app client secret
-   - `WHOOP_REDIRECT_URI`: `https://your-app.railway.app/callback`
-5. Add a volume mounted at `/data` for persistent SQLite storage
-6. Deploy!
-
-### 3. Authorize with Whoop
-
-1. Visit `https://your-app.railway.app/health` to verify it's running
-2. The first time you use the `get_auth_url` tool in Claude, it will provide an authorization link
-3. Visit the link, log in to Whoop, and authorize the app
-4. You'll be redirected back and the initial 90-day sync will begin
-
-### 4. Connect to Claude
-
-1. Go to Claude.ai settings → Connectors
-2. Click "Add custom connector"
-3. Enter:
-   - **Name**: Whoop
-   - **Remote MCP server URL**: `https://your-app.railway.app/mcp`
-4. Use it in any chat!
-
-## Local Development
+## Local development
 
 ```bash
-# Install dependencies
 npm install
-
-# Create .env file
-cat > .env << EOF
-WHOOP_CLIENT_ID=your_client_id
-WHOOP_CLIENT_SECRET=your_client_secret
-WHOOP_REDIRECT_URI=http://localhost:3000/callback
-MCP_MODE=http
-EOF
-
-# Run in development mode
-npm run dev
+python3 -m venv .venv && .venv/bin/pip install -r garmin/requirements.txt
+BASE_URL=http://localhost:3000 GARMIN_PYTHON=.venv/bin/python GARMIN_OWNER_EMAIL=you@example.com \
+  ENCRYPTION_SECRET=dev SYNC_SECRET=dev npm run dev
 ```
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `WHOOP_CLIENT_ID` | Whoop OAuth client ID | Required |
-| `WHOOP_CLIENT_SECRET` | Whoop OAuth client secret | Required |
-| `WHOOP_REDIRECT_URI` | OAuth callback URL | `http://localhost:3000/callback` |
-| `DB_PATH` | SQLite database path | `./whoop.db` |
-| `PORT` | HTTP server port | `3000` |
-| `MCP_MODE` | `http` for remote, `stdio` for local | `http` |
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│              Whoop MCP Server                   │
-│                                                 │
-│  ┌─────────────┐      ┌──────────────────┐    │
-│  │ MCP Server  │◄────►│  SQLite Database │    │
-│  │ (HTTP)      │      │  - cycles        │    │
-│  └─────────────┘      │  - recovery      │    │
-│         │             │  - sleep         │    │
-│         │             │  - workouts      │    │
-│         ▼             │  - tokens        │    │
-│  ┌─────────────┐      └──────────────────┘    │
-│  │ Whoop API   │                               │
-│  │ Client      │                               │
-│  └─────────────┘                               │
-└─────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────┐
-│  Claude.ai (Custom Connector)                   │
-│  "Hey, what's my recovery today?"               │
-└─────────────────────────────────────────────────┘
-```
-
-## API Endpoints Used
-
-This server uses the following Whoop API v2 endpoints:
-
-- `GET /v2/user/profile/basic` - User profile
-- `GET /v2/user/measurement/body` - Body measurements
-- `GET /v2/cycle` - Physiological cycles (strain data)
-- `GET /v2/recovery` - Recovery scores
-- `GET /v2/activity/sleep` - Sleep records
-- `GET /v2/activity/workout` - Workout records
-
-## License
-
-MIT - See [LICENSE](LICENSE) for details.

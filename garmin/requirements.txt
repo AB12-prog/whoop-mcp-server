@@ -1,0 +1,5 @@
+# Garmin Connect changes its auth flow from time to time; the library ships
+# fixes in minor releases, so allow those in on each redeploy.
+# [workout] adds pydantic for the typed workout builders.
+garminconnect[workout]>=0.3.17,<0.4
+curl_cffi>=0.15
