@@ -166,7 +166,7 @@ export class WhoopClient {
 			refresh_token: data.refresh_token ?? this.tokens!.refresh_token,
 			expires_at: Date.now() + data.expires_in * 1000,
 		};
-		console.log(`[whoop] token refresh ok (rt …${this.tokens.refresh_token.slice(-6)})`);
+		console.log("[whoop] token refresh ok");
 		this.persistTokens();
 	}
 

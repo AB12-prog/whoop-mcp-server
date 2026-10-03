@@ -37,11 +37,32 @@ const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes — room for an emailed MFA
 // rate-limited) or as a password-guessing oracle.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_PER_WINDOW = 8;
+// After this many consecutive rejected sign-ins, lock sign-in for 15 min,
+// doubling with each further failure up to a day. Online password guessing
+// through this page drops to a handful per day; a correct sign-in resets it.
+// (The repo is public, so assume the URL and owner email are known.)
+const LOCKOUT_AFTER_FAILURES = 5;
+const LOCKOUT_BASE_MS = 15 * 60 * 1000;
+const LOCKOUT_MAX_MS = 24 * 60 * 60 * 1000;
+// Unauthenticated GETs that create a pending sign-in row.
+const PENDING_PER_IP_PER_WINDOW = 30;
+const PENDING_MAX_ROWS = 500;
 
 export type LoginOutcome = { status: 'ok' } | { status: 'mfa_required'; pendingId: string };
 
-/** Error whose message is safe to show on the sign-in page. */
-export class LoginError extends Error {}
+/**
+ * Error whose message is safe to show on the sign-in page. `countsAsFailure`
+ * marks a rejected credential/code (feeds the lockout); transport problems
+ * such as Garmin being unreachable or rate limiting the server don't.
+ */
+export class LoginError extends Error {
+	constructor(
+		message: string,
+		readonly countsAsFailure = true
+	) {
+		super(message);
+	}
+}
 
 export interface LoginProvider {
 	login(email: string, password: string): Promise<LoginOutcome>;
@@ -191,13 +212,42 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			AND client_id NOT IN (SELECT client_id FROM oauth_tokens)
 		`).run(now - 30 * 24 * 60 * 60 * 1000);
 	}
-	setInterval(cleanup, 5 * 60 * 1000);
+	setInterval(cleanup, 5 * 60 * 1000).unref();
 
 	// Simple in-memory rate limit for the unauthenticated /register endpoint.
 	const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 	const REGISTER_MAX_PER_WINDOW = 30;
 	let registerWindowStart = Date.now();
 	let registerCount = 0;
+
+	// Per-IP fixed-window counters for unauthenticated endpoints.
+	const ipHits = new Map<string, { start: number; count: number }>();
+	function ipAllowed(req: Request, bucket: string, max: number, windowMs = LOGIN_WINDOW_MS): boolean {
+		const key = `${bucket}:${req.ip ?? 'unknown'}`;
+		const now = Date.now();
+		const hit = ipHits.get(key);
+		if (!hit || now - hit.start > windowMs) {
+			ipHits.set(key, { start: now, count: 1 });
+			return true;
+		}
+		hit.count++;
+		return hit.count <= max;
+	}
+	setInterval(() => {
+		const now = Date.now();
+		for (const [k, v] of ipHits) if (now - v.start > LOGIN_WINDOW_MS) ipHits.delete(k);
+	}, 5 * 60 * 1000).unref();
+
+	/** Refuse to create more pending sign-ins when one IP or the table is flooding. */
+	function pendingAllowed(req: Request, res: Response): boolean {
+		const count = (db.prepare('SELECT COUNT(*) AS n FROM oauth_pending').get() as { n: number }).n;
+		if (!ipAllowed(req, 'pending', PENDING_PER_IP_PER_WINDOW) || count >= PENDING_MAX_ROWS) {
+			console.error('[oauth] pending sign-in limit hit');
+			res.status(429).type('text/plain').send('Too many sign-in requests. Wait a few minutes and try again.');
+			return false;
+		}
+		return true;
+	}
 
 	// ---- Discovery metadata -------------------------------------------------
 
@@ -255,7 +305,8 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		const ALLOWED_REDIRECT_HOSTS = new Set(['claude.ai', 'claude.com']);
 		const allValid = redirectUris.every(u => {
 			try {
-				return ALLOWED_REDIRECT_HOSTS.has(new URL(u).hostname);
+				const parsed = new URL(u);
+				return parsed.protocol === 'https:' && ALLOWED_REDIRECT_HOSTS.has(parsed.hostname);
 			} catch {
 				return false;
 			}
@@ -311,6 +362,8 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			return;
 		}
 
+		if (!pendingAllowed(req, res)) return;
+
 		// Stash Claude's request under a fresh, unguessable state. The sign-in
 		// form carries it, and it is the only handle that can complete this flow.
 		// (Column is still named whoop_state from the WHOOP era.)
@@ -333,7 +386,8 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 	// one this server is bound to.
 	const REAUTH_CLIENT_ID = '__garmin_reauth__';
 
-	app.get('/reauth', (_req: Request, res: Response) => {
+	app.get('/reauth', (req: Request, res: Response) => {
+		if (!pendingAllowed(req, res)) return;
 		const loginState = crypto.randomUUID();
 		db.prepare(`
 			INSERT INTO oauth_pending (whoop_state, client_id, redirect_uri, code_challenge, client_state, created_at)
@@ -361,14 +415,36 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 
 	let loginWindowStart = Date.now();
 	let loginCount = 0;
-	function loginAllowed(): boolean {
+	let consecutiveFailures = 0;
+	let lockedUntil = 0;
+	/** Null if a sign-in attempt may go ahead, else the message to show. */
+	function loginBlocked(req: Request): string | null {
 		const now = Date.now();
+		if (now < lockedUntil) {
+			const mins = Math.ceil((lockedUntil - now) / 60_000);
+			return `Sign-in is locked after repeated failed attempts. Try again in ${mins >= 90 ? `${Math.ceil(mins / 60)} hours` : `${mins} minutes`}.`;
+		}
+		if (!ipAllowed(req, 'login', LOGIN_MAX_PER_WINDOW)) return 'Too many sign-in attempts. Wait 15 minutes and try again.';
 		if (now - loginWindowStart > LOGIN_WINDOW_MS) {
 			loginWindowStart = now;
 			loginCount = 0;
 		}
 		loginCount++;
-		return loginCount <= LOGIN_MAX_PER_WINDOW;
+		return loginCount <= LOGIN_MAX_PER_WINDOW ? null : 'Too many sign-in attempts. Wait 15 minutes and try again.';
+	}
+	function recordLoginResult(err: unknown): void {
+		if (!err) {
+			consecutiveFailures = 0;
+			lockedUntil = 0;
+			return;
+		}
+		if (!(err instanceof LoginError) || !err.countsAsFailure) return;
+		consecutiveFailures++;
+		if (consecutiveFailures >= LOCKOUT_AFTER_FAILURES) {
+			const ms = Math.min(LOCKOUT_BASE_MS * 2 ** (consecutiveFailures - LOCKOUT_AFTER_FAILURES), LOCKOUT_MAX_MS);
+			lockedUntil = Date.now() + ms;
+			console.error(`[oauth] ${consecutiveFailures} consecutive failed sign-ins; locked for ${Math.round(ms / 60_000)} min`);
+		}
 	}
 
 	function userMessage(err: unknown): string {
@@ -412,9 +488,10 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			sendPage(res, loginForm(st, 'Sign in', 'Enter your Garmin email and password.'), 400);
 			return;
 		}
-		if (!loginAllowed()) {
-			console.error('[oauth] sign-in rate limit hit');
-			sendPage(res, loginForm(st, 'Sign in', 'Too many sign-in attempts. Wait 15 minutes and try again.'), 429);
+		const blocked = loginBlocked(req);
+		if (blocked) {
+			console.error('[oauth] sign-in throttled');
+			sendPage(res, loginForm(st, 'Sign in', blocked), 429);
 			return;
 		}
 		try {
@@ -423,8 +500,10 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 				sendPage(res, mfaForm(st, outcome.pendingId));
 				return;
 			}
+			recordLoginResult(null);
 			complete(res, st, pending);
 		} catch (err) {
+			recordLoginResult(err);
 			sendPage(res, loginForm(st, 'Sign in', userMessage(err)), 401);
 		}
 	});
@@ -437,14 +516,17 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			return;
 		}
 		const st = state as string;
-		if (!loginAllowed()) {
-			sendPage(res, mfaForm(st, pending_id, 'Too many attempts. Wait 15 minutes and start again.'), 429);
+		const blocked = loginBlocked(req);
+		if (blocked) {
+			sendPage(res, mfaForm(st, pending_id, blocked), 429);
 			return;
 		}
 		try {
 			await loginProvider.verifyMfa(pending_id, typeof code === 'string' ? code : '');
+			recordLoginResult(null);
 			complete(res, st, pending);
 		} catch (err) {
+			recordLoginResult(err);
 			sendPage(res, mfaForm(st, pending_id, userMessage(err)), 401);
 		}
 	});

@@ -73,32 +73,38 @@ function expectedGarminProfileId(): number | null {
 	return garminStore.getAccount()?.profile_id ?? null;
 }
 
+// Same wording as a wrong password, so the sign-in page can't be used to
+// confirm which email owns this server.
+const BAD_CREDENTIALS = "Garmin didn't accept that email and password.";
+
 function checkOwnerEmail(email: string): void {
 	const ownerEmail = (process.env.GARMIN_OWNER_EMAIL ?? '').trim().toLowerCase();
 	if (expectedGarminProfileId() != null) {
 		// Already bound: the bridge enforces the profile id. The email check
 		// still applies if configured, as a cheap early reject.
-		if (ownerEmail && email.toLowerCase() !== ownerEmail) throw new LoginError("That Garmin account isn't the one this server belongs to.");
+		if (ownerEmail && email.toLowerCase() !== ownerEmail) throw new LoginError(BAD_CREDENTIALS);
 		return;
 	}
 	if (!ownerEmail) {
-		throw new LoginError('Server not set up yet: set GARMIN_OWNER_EMAIL in Railway, redeploy, then sign in.');
+		throw new LoginError('Server not set up yet: set GARMIN_OWNER_EMAIL in Railway, redeploy, then sign in.', false);
 	}
-	if (email.toLowerCase() !== ownerEmail) throw new LoginError("That Garmin account isn't the one this server belongs to.");
+	if (email.toLowerCase() !== ownerEmail) throw new LoginError(BAD_CREDENTIALS);
 }
 
 function garminLoginError(err: unknown): never {
 	if (err instanceof LoginError) throw err;
 	if (err instanceof GarminBridgeError) {
 		const messages: Record<string, string> = {
-			auth: "Garmin didn't accept that email and password.",
-			wrong_account: "That Garmin account isn't the one this server belongs to.",
+			auth: BAD_CREDENTIALS,
+			wrong_account: BAD_CREDENTIALS,
 			bad_code: "That code didn't work. Check it and try again.",
 			expired: 'That sign-in expired. Start again.',
 			rate_limited: 'Garmin is limiting sign-ins right now. Wait a few minutes and try again.',
 		};
 		console.error('[garmin] sign-in failed:', err.code, err.message);
-		throw new LoginError(messages[err.code] ?? "Couldn't reach Garmin. Try again shortly.");
+		// Only rejected credentials/codes count towards the sign-in lockout.
+		const countsAsFailure = ['auth', 'wrong_account', 'bad_code'].includes(err.code);
+		throw new LoginError(messages[err.code] ?? "Couldn't reach Garmin. Try again shortly.", countsAsFailure);
 	}
 	throw err;
 }
@@ -506,8 +512,12 @@ async function main(): Promise<void> {
 		process.stderr.write('Health MCP server running on stdio\n');
 	} else {
 		const app = express();
-		app.use(express.json());
-		app.use(express.urlencoded({ extended: true }));
+		// Railway terminates TLS at one proxy hop; trust it so req.ip is the client (per-IP limits).
+		app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+		app.disable('x-powered-by');
+		app.use(express.json({ limit: '1mb' }));
+		// Sign-in forms are flat key/value pairs: the simple parser avoids qs entirely.
+		app.use(express.urlencoded({ extended: false, limit: '32kb' }));
 
 		const baseUrl = (process.env.BASE_URL ?? '').replace(/\/+$/, '');
 		if (!baseUrl) {
@@ -524,7 +534,20 @@ async function main(): Promise<void> {
 		// Start the Garmin sidecar now so the first tool call doesn't pay for it.
 		garminBridge.warmUp();
 
-		app.get('/health', (_req: Request, res: Response) => {
+		const hasSyncSecret = (req: Request): boolean => {
+			const secret = process.env.SYNC_SECRET ?? '';
+			const provided = Buffer.from(req.header('x-sync-secret') ?? '');
+			const expected = Buffer.from(secret);
+			return secret.length > 0 && provided.length === expected.length && timingSafeEqual(provided, expected);
+		};
+
+		app.get('/health', (req: Request, res: Response) => {
+			// Public: liveness only. Sync detail (errors, token timestamps, stored
+			// ranges) needs the x-sync-secret header.
+			if (!hasSyncSecret(req)) {
+				res.json({ status: 'ok' });
+				return;
+			}
 			const garminState = garminStore.getSyncState();
 			const account = garminStore.getAccount();
 			res.json({
