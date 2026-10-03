@@ -1,15 +1,18 @@
 // src/oauth-proxy.ts
 //
-// Turns the WHOOP MCP server into a minimal OAuth 2.1 authorization server
-// that Claude.ai's web custom connector can authenticate against.
+// Turns this MCP server into a minimal OAuth 2.1 authorization server that
+// Claude.ai's custom connector can authenticate against.
 //
-// Design: this is an OAuth *proxy*. Claude authenticates to THIS server; the
-// /authorize step redirects the user to WHOOP's real login, and only after a
-// successful WHOOP login does this server mint a Claude authorization code.
-// That means there is no "rubber stamp" hole: to obtain a token you must
-// actually log in to the WHOOP account. Completing Claude's OAuth flow also
-// authenticates WHOOP as a side effect (the WHOOP tokens get saved in /callback),
-// so a single login wires up both sides.
+// Design: the /authorize step shows a sign-in page served by THIS server where
+// the owner signs in with their Garmin Connect account (email, password, and
+// Garmin's emailed/app code when MFA is on). Only after Garmin accepts the login
+// — and the account is verified to be the one this server is bound to — does
+// the server mint a Claude authorization code. Completing Claude's OAuth flow
+// therefore also (re)connects Garmin, so one sign-in wires up both sides.
+// The Garmin password is relayed straight to Garmin and never stored or logged.
+//
+// (History: this used to proxy WHOOP's OAuth login. WHOOP is now a read-only
+// archive; connector tokens issued under the old flow remain valid.)
 //
 // Standards notes:
 //  - PKCE S256 is required (Claude always sends it).
@@ -17,40 +20,41 @@
 //    public client (token_endpoint_auth_method = "none"), so no client secret.
 //  - Authorization codes are single-use and short-lived.
 //  - Server-issued access/refresh tokens are stored only as SHA-256 hashes.
-//  - Refresh tokens rotate on use (OAuth 2.1 requirement for public clients).
 
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import type { Express, Request, Response, NextFunction } from 'express';
 
-const WHOOP_AUTH_BASE = 'https://api.prod.whoop.com/oauth/oauth2';
-
-// WHOOP scopes requested during the proxied login. read:profile pulls name+email;
-// drop it if you want the server to never receive any identifying field.
-const WHOOP_SCOPES = [
-	'read:profile',
-	'read:body_measurement',
-	'read:cycles',
-	'read:recovery',
-	'read:sleep',
-	'read:workout',
-	'offline',
-];
+const SCOPE = 'health:read';
 
 const ACCESS_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — fewer refreshes = fewer races with Claude
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes — room for an emailed MFA code
+
+// Sign-in attempts are relayed to Garmin, so throttle them hard: this keeps the
+// page from being used to hammer Garmin (which would also get the server's IP
+// rate-limited) or as a password-guessing oracle.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_PER_WINDOW = 8;
+
+export type LoginOutcome = { status: 'ok' } | { status: 'mfa_required'; pendingId: string };
+
+/** Error whose message is safe to show on the sign-in page. */
+export class LoginError extends Error {}
+
+export interface LoginProvider {
+	login(email: string, password: string): Promise<LoginOutcome>;
+	verifyMfa(pendingId: string, code: string): Promise<void>;
+}
 
 interface OAuthProxyOptions {
 	app: Express;
 	dbPath: string;
 	baseUrl: string; // public https URL of THIS server, no trailing slash
-	whoopClientId: string;
-	whoopRedirectUri: string; // must equal `${baseUrl}/callback`
-	// Exchanges a WHOOP authorization code for tokens and persists them.
-	// Provided by index.ts so this module stays decoupled from the WHOOP client.
-	exchangeAndSaveWhoopCode: (code: string) => Promise<void>;
+	// Performs the Garmin sign-in (and account binding check). Provided by
+	// index.ts so this module stays decoupled from the Garmin bridge.
+	loginProvider: LoginProvider;
 }
 
 interface OAuthProxy {
@@ -69,8 +73,76 @@ function randomToken(): string {
 	return crypto.randomBytes(32).toString('base64url');
 }
 
+// ---- Sign-in pages -----------------------------------------------------------
+
+function escapeHtml(value: string): string {
+	return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]!);
+}
+
+function page(title: string, body: string): string {
+	return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>${escapeHtml(title)}</title>
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--fg:#1d1d1b;--muted:#6b6a66;--line:#dcdad4;--accent:#0b6bcb;--err:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#212120;--fg:#ecebe7;--muted:#a3a29d;--line:#3a3936;--accent:#5aa6f0;--err:#f0857a}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+main{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px}
+h1{font-size:20px;margin:0 0 4px}p{margin:0 0 18px;color:var(--muted);font-size:14px}
+label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:transparent;color:var(--fg);font-size:16px}
+input:focus{outline:2px solid var(--accent);outline-offset:1px}
+button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:9px;background:var(--accent);color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+.err{color:var(--err);font-size:14px;margin:0 0 6px}.fine{margin:16px 0 0;font-size:12px}
+</style></head><body><main>${body}</main></body></html>`;
+}
+
+function loginForm(state: string, heading: string, error?: string): string {
+	return page(heading, `<h1>${escapeHtml(heading)}</h1>
+<p>Sign in with your Garmin Connect account.</p>
+${error ? `<p class="err" role="alert">${escapeHtml(error)}</p>` : ''}
+<form method="post" action="/authorize/login" autocomplete="on">
+<input type="hidden" name="state" value="${escapeHtml(state)}">
+<label for="email">Garmin email</label><input id="email" name="email" type="email" autocomplete="username" required autofocus>
+<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button>
+</form>
+<p class="fine">Your password goes straight to Garmin and is never stored.</p>`);
+}
+
+function mfaForm(state: string, pendingId: string, error?: string): string {
+	return page('Verification code', `<h1>Verification code</h1>
+<p>Garmin sent a code to your email or authenticator app.</p>
+${error ? `<p class="err" role="alert">${escapeHtml(error)}</p>` : ''}
+<form method="post" action="/authorize/mfa">
+<input type="hidden" name="state" value="${escapeHtml(state)}">
+<input type="hidden" name="pending_id" value="${escapeHtml(pendingId)}">
+<label for="code">Code</label><input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{4,12}" required autofocus>
+<button type="submit">Verify</button>
+</form>`);
+}
+
+function messagePage(heading: string, message: string): string {
+	return page(heading, `<h1>${escapeHtml(heading)}</h1><p>${escapeHtml(message)}</p>`);
+}
+
+function sendPage(res: Response, html: string, status = 200): void {
+	res
+		.status(status)
+		.set({
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-store',
+			'X-Frame-Options': 'DENY',
+			// form-action also governs the redirect after a successful POST, so it
+			// must allow Claude's callback hosts (the only ones /register accepts).
+			'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://claude.ai https://claude.com; frame-ancestors 'none'; base-uri 'none'",
+			'Referrer-Policy': 'no-referrer',
+		})
+		.send(html);
+}
+
 export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
-	const { app, baseUrl, whoopClientId, whoopRedirectUri, exchangeAndSaveWhoopCode } = opts;
+	const { app, baseUrl, loginProvider } = opts;
 
 	const db = new Database(opts.dbPath);
 	db.pragma('journal_mode = WAL');
@@ -132,7 +204,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 	const protectedResource = {
 		resource: `${baseUrl}/mcp`,
 		authorization_servers: [baseUrl],
-		scopes_supported: ['whoop:read'],
+		scopes_supported: [SCOPE],
 		bearer_methods_supported: ['header'],
 	};
 
@@ -145,7 +217,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		grant_types_supported: ['authorization_code', 'refresh_token'],
 		code_challenge_methods_supported: ['S256'],
 		token_endpoint_auth_methods_supported: ['none'],
-		scopes_supported: ['whoop:read'],
+		scopes_supported: [SCOPE],
 	};
 
 	// Claude probes the bare path and, as a fallback, the path-suffixed variant.
@@ -239,99 +311,79 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			return;
 		}
 
-		// Stash Claude's request, keyed by a fresh state we hand to WHOOP.
-		const whoopState = crypto.randomUUID();
+		// Stash Claude's request under a fresh, unguessable state. The sign-in
+		// form carries it, and it is the only handle that can complete this flow.
+		// (Column is still named whoop_state from the WHOOP era.)
+		const loginState = crypto.randomUUID();
 		db.prepare(`
 			INSERT INTO oauth_pending (whoop_state, client_id, redirect_uri, code_challenge, client_state, created_at)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`).run(whoopState, client_id, redirect_uri, code_challenge, state ?? null, Date.now());
+		`).run(loginState, client_id, redirect_uri, code_challenge, state ?? null, Date.now());
 
-		console.log('[oauth] /authorize ok -> redirecting to WHOOP login');
-		const params = new URLSearchParams({
-			client_id: whoopClientId,
-			redirect_uri: whoopRedirectUri,
-			response_type: 'code',
-			scope: WHOOP_SCOPES.join(' '),
-			state: whoopState,
-		});
-		res.redirect(`${WHOOP_AUTH_BASE}/auth?${params.toString()}`);
+		console.log('[oauth] /authorize ok -> Garmin sign-in page');
+		sendPage(res, loginForm(loginState, 'Connect Claude to your health data'));
 	});
 
-	// ---- Direct WHOOP re-authorization --------------------------------------
+	// ---- Direct Garmin re-authorization --------------------------------------
 	//
-	// Refreshes only the WHOOP side of the setup (new WHOOP grant, tokens saved)
-	// without touching Claude's connector tokens — for when the WHOOP refresh
-	// token chain dies but the connector itself still works. Unauthenticated by
-	// design, and safe that way: /callback only accepts a state this server
-	// issued, and exchangeAndSaveWhoopCode refuses to persist tokens for any
-	// WHOOP account other than the one this server is bound to.
-	const REAUTH_CLIENT_ID = '__whoop_reauth__';
+	// Reconnects only the Garmin side (fresh Garmin session) without touching
+	// Claude's connector tokens — for when the Garmin session dies but the
+	// connector itself still works. Unauthenticated by design, and safe that way:
+	// the login provider refuses to activate any Garmin account other than the
+	// one this server is bound to.
+	const REAUTH_CLIENT_ID = '__garmin_reauth__';
 
 	app.get('/reauth', (_req: Request, res: Response) => {
-		const whoopState = crypto.randomUUID();
+		const loginState = crypto.randomUUID();
 		db.prepare(`
 			INSERT INTO oauth_pending (whoop_state, client_id, redirect_uri, code_challenge, client_state, created_at)
 			VALUES (?, ?, '', '', NULL, ?)
-		`).run(whoopState, REAUTH_CLIENT_ID, Date.now());
-
-		console.log('[oauth] /reauth -> redirecting to WHOOP login');
-		const params = new URLSearchParams({
-			client_id: whoopClientId,
-			redirect_uri: whoopRedirectUri,
-			response_type: 'code',
-			scope: WHOOP_SCOPES.join(' '),
-			state: whoopState,
-		});
-		res.redirect(`${WHOOP_AUTH_BASE}/auth?${params.toString()}`);
+		`).run(loginState, REAUTH_CLIENT_ID, Date.now());
+		console.log('[oauth] /reauth -> Garmin sign-in page');
+		sendPage(res, loginForm(loginState, 'Reconnect Garmin'));
 	});
 
-	// ---- WHOOP callback (completes both WHOOP auth and Claude's flow) --------
+	// The retired WHOOP callback: say so plainly instead of a bare 404.
+	app.get('/callback', (_req: Request, res: Response) => {
+		res.status(410).type('text/plain').send('WHOOP sign-in has been retired on this server. Use /reauth to connect Garmin.');
+	});
 
-	app.get('/callback', async (req: Request, res: Response) => {
-		const code = req.query.code as string | undefined;
-		const state = req.query.state as string | undefined;
-		const error = req.query.error as string | undefined;
-		console.log('[oauth] /callback hit', { hasCode: Boolean(code), hasState: Boolean(state), hasError: Boolean(error) });
+	// ---- Sign-in form handlers ----------------------------------------------
 
-		if (error) {
-			// Do NOT reflect the raw error value into the response (XSS guard).
-			console.error('[oauth] /callback WHOOP returned error:', error);
-			res.status(400).type('text/plain').send('WHOOP authorization was denied or failed.');
-			return;
+	type PendingRow = { client_id: string; redirect_uri: string; code_challenge: string; client_state: string | null; created_at: number };
+
+	function getPending(state: unknown): PendingRow | null {
+		if (typeof state !== 'string' || !state) return null;
+		const row = db.prepare('SELECT * FROM oauth_pending WHERE whoop_state = ?').get(state) as PendingRow | undefined;
+		if (!row || Date.now() - row.created_at > PENDING_TTL_MS) return null;
+		return row;
+	}
+
+	let loginWindowStart = Date.now();
+	let loginCount = 0;
+	function loginAllowed(): boolean {
+		const now = Date.now();
+		if (now - loginWindowStart > LOGIN_WINDOW_MS) {
+			loginWindowStart = now;
+			loginCount = 0;
 		}
-		if (!code || !state) {
-			res.status(400).type('text/plain').send('Missing authorization code or state.');
-			return;
-		}
+		loginCount++;
+		return loginCount <= LOGIN_MAX_PER_WINDOW;
+	}
 
-		// Validate FIRST: only act on a flow this server actually started. This blocks
-		// unsolicited callbacks from triggering a token exchange or overwriting tokens.
-		const pending = db.prepare('SELECT * FROM oauth_pending WHERE whoop_state = ?').get(state) as
-			| { client_id: string; redirect_uri: string; code_challenge: string; client_state: string | null }
-			| undefined;
-		if (!pending) {
-			console.error('[oauth] /callback rejected: unknown or expired state');
-			res.status(400).type('text/plain').send('Unknown or expired authorization request.');
-			return;
-		}
+	function userMessage(err: unknown): string {
+		if (err instanceof LoginError) return err.message;
+		console.error('[oauth] sign-in failed unexpectedly', err instanceof Error ? err.message : err);
+		return 'Something went wrong talking to Garmin. Try again shortly.';
+	}
 
-		// Now it's safe to exchange the WHOOP code and persist tokens.
-		try {
-			await exchangeAndSaveWhoopCode(code);
-			console.log('[oauth] /callback WHOOP tokens saved');
-		} catch (e) {
-			console.error('[oauth] /callback WHOOP exchange FAILED', e instanceof Error ? e.message : e);
-			res.status(500).type('text/plain').send('WHOOP token exchange failed.');
-			return;
-		}
-
+	// Finish a successful sign-in: either the reauth page, or Claude's flow.
+	function complete(res: Response, state: string, pending: PendingRow): void {
 		db.prepare('DELETE FROM oauth_pending WHERE whoop_state = ?').run(state);
 
-		// A /reauth flow ends here: WHOOP tokens are saved and there is no
-		// Claude client waiting for an authorization code.
 		if (pending.client_id === REAUTH_CLIENT_ID) {
-			console.log('[oauth] /callback re-auth complete');
-			res.type('text/plain').send('WHOOP re-connected. Scheduled syncs will resume; you can close this tab.');
+			console.log('[oauth] Garmin re-auth complete');
+			sendPage(res, messagePage('Garmin connected', 'Garmin is connected and syncing. You can close this tab.'));
 			return;
 		}
 
@@ -344,8 +396,57 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 		const redirect = new URL(pending.redirect_uri);
 		redirect.searchParams.set('code', authCode);
 		if (pending.client_state) redirect.searchParams.set('state', pending.client_state);
-		console.log('[oauth] /callback -> redirecting to Claude', pending.redirect_uri);
-		res.redirect(redirect.toString());
+		console.log('[oauth] sign-in ok -> redirecting to Claude', pending.redirect_uri);
+		res.redirect(303, redirect.toString());
+	}
+
+	app.post('/authorize/login', async (req: Request, res: Response) => {
+		const { state, email, password } = (req.body ?? {}) as Record<string, unknown>;
+		const pending = getPending(state);
+		if (!pending) {
+			sendPage(res, messagePage('Sign-in expired', 'This sign-in link has expired. Start again from Claude (or /reauth).'), 400);
+			return;
+		}
+		const st = state as string;
+		if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
+			sendPage(res, loginForm(st, 'Sign in', 'Enter your Garmin email and password.'), 400);
+			return;
+		}
+		if (!loginAllowed()) {
+			console.error('[oauth] sign-in rate limit hit');
+			sendPage(res, loginForm(st, 'Sign in', 'Too many sign-in attempts. Wait 15 minutes and try again.'), 429);
+			return;
+		}
+		try {
+			const outcome = await loginProvider.login(email.trim(), password);
+			if (outcome.status === 'mfa_required') {
+				sendPage(res, mfaForm(st, outcome.pendingId));
+				return;
+			}
+			complete(res, st, pending);
+		} catch (err) {
+			sendPage(res, loginForm(st, 'Sign in', userMessage(err)), 401);
+		}
+	});
+
+	app.post('/authorize/mfa', async (req: Request, res: Response) => {
+		const { state, pending_id, code } = (req.body ?? {}) as Record<string, unknown>;
+		const pending = getPending(state);
+		if (!pending || typeof pending_id !== 'string') {
+			sendPage(res, messagePage('Sign-in expired', 'This sign-in link has expired. Start again from Claude (or /reauth).'), 400);
+			return;
+		}
+		const st = state as string;
+		if (!loginAllowed()) {
+			sendPage(res, mfaForm(st, pending_id, 'Too many attempts. Wait 15 minutes and start again.'), 429);
+			return;
+		}
+		try {
+			await loginProvider.verifyMfa(pending_id, typeof code === 'string' ? code : '');
+			complete(res, st, pending);
+		} catch (err) {
+			sendPage(res, mfaForm(st, pending_id, userMessage(err)), 401);
+		}
 	});
 
 	// ---- Token endpoint -----------------------------------------------------
@@ -432,7 +533,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 				token_type: 'Bearer',
 				expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
 				refresh_token,
-				scope: 'whoop:read',
+				scope: SCOPE,
 			});
 			return;
 		}
@@ -467,7 +568,7 @@ export function mountOAuthProxy(opts: OAuthProxyOptions): OAuthProxy {
 			token_type: 'Bearer',
 			expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
 			refresh_token: refreshToken,
-			scope: 'whoop:read',
+			scope: SCOPE,
 		};
 	}
 

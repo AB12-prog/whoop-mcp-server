@@ -1,7 +1,7 @@
 {
   "name": "whoop-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server for Whoop health data integration",
+  "description": "MCP server for Garmin Connect health data with a WHOOP archive",
   "author": "Yuri Dvoinos",
   "license": "MIT",
   "repository": {
@@ -10,6 +10,7 @@
   },
   "keywords": [
     "mcp",
+    "garmin",
     "whoop",
     "claude",
     "health",

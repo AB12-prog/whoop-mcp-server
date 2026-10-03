@@ -1,0 +1,4 @@
+# Garmin Connect changes its auth flow from time to time; the library ships
+# fixes in minor releases, so allow those in on each redeploy.
+garminconnect>=0.3.17,<0.4
+curl_cffi>=0.15
