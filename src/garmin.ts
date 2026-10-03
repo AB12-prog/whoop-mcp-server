@@ -106,7 +106,8 @@ export class GarminBridge {
 			throw new Error(`Garmin bridge script not found at ${this.opts.script}`);
 		}
 		const proc = spawn(this.opts.python, [this.opts.script], {
-			env: { ...process.env, BRIDGE_SECRET: this.secret, PYTHONUNBUFFERED: '1' },
+			// TZ makes the bridge's local-time maths (weigh-in timestamps) use the owner's zone.
+			env: { ...process.env, BRIDGE_SECRET: this.secret, PYTHONUNBUFFERED: '1', TZ: LOCAL_TZ },
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});
 

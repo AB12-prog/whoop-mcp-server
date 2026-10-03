@@ -21,6 +21,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -33,6 +34,19 @@ from garminconnect import (
     GarminConnectAuthenticationError,
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
+    exercises,
+)
+from garminconnect.workout import (
+    ConditionType,
+    ExecutableStep,
+    RunningWorkout,
+    SportType,
+    StepType,
+    StrengthWorkout,
+    TargetType,
+    WorkoutSegment,
+    create_repeat_group,
+    create_strength_set,
 )
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="[garmin-bridge] %(levelname)s %(message)s")
@@ -376,6 +390,442 @@ def h_activities(body: dict[str, Any]) -> dict[str, Any]:
     return {"activities": out}
 
 
+# ------------------------------------------------------------- workouts ---
+#
+# Every write takes "dry_run": when true the request is fully validated and
+# built (exercise names resolved, steps assembled) and a human-readable preview
+# is returned, but nothing is sent to Garmin. Node maps the tools' `confirm`
+# flag onto this, so a write always has a preview step before it happens.
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PACE_RE = re.compile(r"^(\d{1,2}):([0-5]\d)$")
+NO_TARGET = {"workoutTargetTypeId": TargetType.NO_TARGET, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
+RUN_STEP_TYPES = {
+    "warmup": (StepType.WARMUP, "warmup", 1),
+    "cooldown": (StepType.COOLDOWN, "cooldown", 2),
+    "interval": (StepType.INTERVAL, "interval", 3),
+    "recovery": (StepType.RECOVERY, "recovery", 4),
+    "rest": (StepType.REST, "rest", 5),
+}
+MAX_STEPS = 60
+
+
+def _date(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not DATE_RE.match(value):
+        raise BridgeError(400, "bad_request", f"{field} must be YYYY-MM-DD")
+    return value
+
+
+def _pos_int(value: Any, field: str, lo: int = 1, hi: int = 10**12) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value or not lo <= int(value) <= hi:
+        raise BridgeError(400, "bad_request", f"{field} must be a whole number between {lo} and {hi}")
+    return int(value)
+
+
+def _pos_num(value: Any, field: str, lo: float, hi: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not lo <= float(value) <= hi:
+        raise BridgeError(400, "bad_request", f"{field} must be a number between {lo} and {hi}")
+    return float(value)
+
+
+def _fmt_secs(s: float) -> str:
+    s = int(round(s))
+    return f"{s // 60}:{s % 60:02d}" if s < 3600 else f"{s // 3600}h{(s % 3600) // 60:02d}"
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+_EX_BY_NORM: dict[str, dict[str, str]] = {}
+for _e in exercises.EXERCISES:
+    _EX_BY_NORM.setdefault(_norm(_e["name"]), _e)
+
+
+def _resolve_exercise(name: Any) -> dict[str, str]:
+    """Match a name to Garmin's catalogue, ignoring case, hyphens and spacing
+    ("pull ups" -> "Pull-up"). Ambiguous or unknown names raise with
+    suggestions instead of guessing."""
+    if not isinstance(name, str) or not name.strip():
+        raise BridgeError(400, "bad_request", "each exercise needs a name")
+    raw = name.strip()
+    key = _norm(raw)
+    for candidate in (key, key[:-1] if key.endswith("s") else None, key[:-2] if key.endswith("es") else None):
+        if candidate and candidate in _EX_BY_NORM:
+            return _EX_BY_NORM[candidate]
+    stem = key[:-1] if key.endswith("s") else key
+    matches = sorted((e for k, e in _EX_BY_NORM.items() if stem and stem in k), key=lambda e: len(e["name"]))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        names = ", ".join(m["name"] for m in matches[:8])
+        raise BridgeError(400, "ambiguous_exercise", f'"{raw}" matches several Garmin exercises: {names}. Use one of these names.')
+    words = [w for w in re.split(r"\W+", raw) if len(w) > 3]
+    near: list[str] = []
+    for w in words:
+        near.extend(sorted((e["name"] for e in exercises.find(w)), key=len)[:4])
+    hint = f" Closest: {', '.join(dict.fromkeys(near))}." if near else ""
+    raise BridgeError(400, "unknown_exercise", f'"{raw}" is not in Garmin\'s exercise catalogue.{hint}')
+
+
+def _build_strength(body: dict[str, Any]) -> tuple[StrengthWorkout, list[str]]:
+    items = body.get("exercises")
+    if not isinstance(items, list) or not items:
+        raise BridgeError(400, "bad_request", "exercises must be a non-empty list")
+    if len(items) > 25:
+        raise BridgeError(400, "bad_request", "at most 25 exercises per workout")
+    steps: list[Any] = []
+    lines: list[str] = []
+    order = 1
+    for i, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise BridgeError(400, "bad_request", f"exercise {i} must be an object")
+        ex = _resolve_exercise(item.get("exercise"))
+        sets = _pos_int(item.get("sets", 3), f"exercise {i} sets", 1, 20)
+        reps = _pos_int(item.get("reps", 10), f"exercise {i} reps", 1, 200)
+        rest = _pos_num(item.get("rest_seconds", 90), f"exercise {i} rest_seconds", 0, 900)
+        weight = item.get("weight_kg")
+        weight_kg = None if weight is None else _pos_num(weight, f"exercise {i} weight_kg", 0, 500)
+        steps.append(create_strength_set(ex["category"], order, sets, reps, rest, exercise_name=ex["exercise"], weight_kg=weight_kg))
+        order += 3
+        load = f" @ {weight_kg:g} kg" if weight_kg is not None else ""
+        lines.append(f"{i}. {ex['name']} — {sets} × {reps}{load}, rest {_fmt_secs(rest)}")
+    workout = StrengthWorkout(
+        workoutName=body["name"],
+        description=body.get("description") or None,
+        estimatedDurationInSecs=0,
+        workoutSegments=[
+            WorkoutSegment(
+                segmentOrder=1,
+                sportType={"sportTypeId": SportType.STRENGTH_TRAINING, "sportTypeKey": "strength_training"},
+                workoutSteps=steps,
+            )
+        ],
+    )
+    return workout, lines
+
+
+class _Order:
+    def __init__(self) -> None:
+        self.n = 0
+
+    def next(self) -> int:
+        self.n += 1
+        if self.n > MAX_STEPS:
+            raise BridgeError(400, "bad_request", f"workout has more than {MAX_STEPS} steps")
+        return self.n
+
+
+def _pace_mps(value: Any, field: str) -> float:
+    m = PACE_RE.match(value) if isinstance(value, str) else None
+    if not m:
+        raise BridgeError(400, "bad_request", f'{field} must be a pace like "5:15" (min:sec per km)')
+    secs = int(m.group(1)) * 60 + int(m.group(2))
+    if not 120 <= secs <= 1200:
+        raise BridgeError(400, "bad_request", f"{field} must be between 2:00 and 20:00 per km")
+    return 1000 / secs
+
+
+def _run_step(step: Any, order: _Order, depth: int, lines: list[str], indent: str) -> Any:
+    if not isinstance(step, dict):
+        raise BridgeError(400, "bad_request", "each step must be an object")
+    kind = step.get("type")
+    if kind == "repeat":
+        if depth >= 1:
+            raise BridgeError(400, "bad_request", "repeats can't be nested inside repeats")
+        times = _pos_int(step.get("times"), "repeat times", 2, 50)
+        inner = step.get("steps")
+        if not isinstance(inner, list) or not inner:
+            raise BridgeError(400, "bad_request", "a repeat needs a non-empty steps list")
+        group_order = order.next()
+        lines.append(f"{indent}Repeat {times}×:")
+        children = [_run_step(s, order, depth + 1, lines, indent + "   ") for s in inner]
+        return create_repeat_group(times, children, group_order)
+    if kind not in RUN_STEP_TYPES:
+        raise BridgeError(400, "bad_request", f"step type must be one of: {', '.join([*RUN_STEP_TYPES, 'repeat'])}")
+
+    type_id, type_key, display = RUN_STEP_TYPES[kind]
+    dist, dur = step.get("distance_m"), step.get("duration_s")
+    if (dist is None) == (dur is None):
+        raise BridgeError(400, "bad_request", f"{kind} step needs exactly one of duration_s or distance_m")
+    if dist is not None:
+        value = _pos_num(dist, f"{kind} distance_m", 50, 100_000)
+        end = {"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}
+        length = f"{value / 1000:g} km" if value >= 1000 else f"{value:g} m"
+    else:
+        value = _pos_num(dur, f"{kind} duration_s", 10, 6 * 3600)
+        end = {"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}
+        length = _fmt_secs(value)
+
+    target: dict[str, Any] = {"targetType": NO_TARGET}
+    label = ""
+    pace, zone = step.get("pace"), step.get("hr_zone")
+    if pace is not None and zone is not None:
+        raise BridgeError(400, "bad_request", f"{kind} step: use pace or hr_zone, not both")
+    if pace is not None:
+        if not isinstance(pace, dict):
+            raise BridgeError(400, "bad_request", 'pace must be {"fast": "4:50", "slow": "5:10"}')
+        fast = _pace_mps(pace.get("fast"), "pace.fast")
+        slow = _pace_mps(pace.get("slow"), "pace.slow")
+        if fast < slow:
+            raise BridgeError(400, "bad_request", "pace.fast must be quicker than (or equal to) pace.slow")
+        target = {
+            "targetType": {"workoutTargetTypeId": TargetType.PACE_ZONE, "workoutTargetTypeKey": "pace.zone", "displayOrder": 1},
+            "targetValueOne": slow,
+            "targetValueTwo": fast,
+        }
+        label = f" @ {pace['fast']}–{pace['slow']} /km"
+    elif zone is not None:
+        z = _pos_int(zone, "hr_zone", 1, 5)
+        target = {
+            "targetType": {"workoutTargetTypeId": TargetType.HEART_RATE_ZONE, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 1},
+            "zoneNumber": z,
+        }
+        label = f" in HR zone {z}"
+
+    lines.append(f"{indent}{kind.capitalize()} {length}{label}")
+    return ExecutableStep(
+        stepOrder=order.next(),
+        stepType={"stepTypeId": type_id, "stepTypeKey": type_key, "displayOrder": display},
+        endCondition=end,
+        endConditionValue=value,
+        **target,
+    )
+
+
+def _build_run(body: dict[str, Any]) -> tuple[RunningWorkout, list[str]]:
+    steps = body.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise BridgeError(400, "bad_request", "steps must be a non-empty list")
+    order = _Order()
+    lines: list[str] = []
+    built = [_run_step(s, order, 0, lines, "") for s in steps]
+    workout = RunningWorkout(
+        workoutName=body["name"],
+        description=body.get("description") or None,
+        estimatedDurationInSecs=0,
+        workoutSegments=[
+            WorkoutSegment(
+                segmentOrder=1,
+                sportType={"sportTypeId": SportType.RUNNING, "sportTypeKey": "running"},
+                workoutSteps=built,
+            )
+        ],
+    )
+    return workout, lines
+
+
+def h_workouts_create(body: dict[str, Any]) -> dict[str, Any]:
+    kind = body.get("kind")
+    name = body.get("name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+        raise BridgeError(400, "bad_request", "name is required (max 80 characters)")
+    body = {**body, "name": name.strip()}
+    if body.get("description") is not None and (not isinstance(body["description"], str) or len(body["description"]) > 500):
+        raise BridgeError(400, "bad_request", "description must be text, max 500 characters")
+    schedule = _date(body["schedule_date"], "schedule_date") if body.get("schedule_date") else None
+    send = bool(body.get("send_to_watch"))
+
+    try:
+        if kind == "strength":
+            workout, lines = _build_strength(body)
+        elif kind == "run":
+            workout, lines = _build_run(body)
+        else:
+            raise BridgeError(400, "bad_request", 'kind must be "strength" or "run"')
+    except ValueError as exc:  # pydantic validation
+        raise BridgeError(400, "bad_request", f"invalid workout: {str(exc)[:300]}") from exc
+
+    preview = {"kind": kind, "name": body["name"], "steps": lines, "schedule_date": schedule, "send_to_watch": send}
+    if body.get("dry_run", True):
+        return {"status": "preview", "preview": preview}
+
+    api = require_active()
+    with _api_lock:
+        created = api.upload_workout(workout.to_dict()) or {}
+        workout_id = created.get("workoutId")
+        if not workout_id:
+            raise BridgeError(502, "garmin_unavailable", "Garmin accepted the request but returned no workout id")
+        result: dict[str, Any] = {"status": "created", "workout_id": workout_id, "preview": preview}
+        # Follow-on steps report their own failure without hiding the created workout.
+        if schedule:
+            try:
+                sched = api.schedule_workout(workout_id, schedule) or {}
+                result["scheduled_workout_id"] = sched.get("workoutScheduleId") or sched.get("id")
+                result["scheduled"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["schedule_error"] = translate(exc).message
+        if send:
+            try:
+                api.push_workout_to_device(workout_id)
+                result["sent_to_watch"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["send_error"] = translate(exc).message
+    return result
+
+
+def h_workouts_list(body: dict[str, Any]) -> dict[str, Any]:
+    api = require_active()
+    months = body.get("months")
+    if not isinstance(months, list) or not months:
+        raise BridgeError(400, "bad_request", "months must be a list of [year, month]")
+    with _api_lock:
+        library = api.get_workouts(0, 30) or []
+        scheduled: list[dict[str, Any]] = []
+        for pair in months[:3]:
+            if not (isinstance(pair, list) and len(pair) == 2):
+                continue
+            year, month = _pos_int(pair[0], "year", 2000, 2100), _pos_int(pair[1], "month", 1, 12)
+            items = g(api.get_scheduled_workouts(year, month), "calendarItems") or []
+            for it in items:
+                if isinstance(it, dict) and it.get("itemType") == "workout":
+                    scheduled.append({
+                        "scheduled_workout_id": it.get("id"),
+                        "workout_id": it.get("workoutId"),
+                        "date": it.get("date"),
+                        "name": it.get("title"),
+                        "sport": it.get("sportTypeKey"),
+                    })
+    lib = [
+        {
+            "workout_id": w.get("workoutId"),
+            "name": w.get("workoutName"),
+            "sport": g(w, "sportType", "sportTypeKey"),
+            "updated": w.get("updatedDate") or w.get("createdDate"),
+        }
+        for w in library
+        if isinstance(w, dict)
+    ]
+    return {"library": lib, "scheduled": sorted(scheduled, key=lambda s: str(s.get("date") or ""))}
+
+
+def _workout_name(api: Garmin, workout_id: int) -> str:
+    try:
+        return str((api.get_workout_by_id(workout_id) or {}).get("workoutName") or f"workout {workout_id}")
+    except Exception as exc:  # noqa: BLE001
+        err = translate(exc)
+        if err.status in (401, 429):
+            raise err from exc
+        raise BridgeError(404, "not_found", f"No workout {workout_id} in your Garmin library") from exc
+
+
+def h_workouts_schedule(body: dict[str, Any]) -> dict[str, Any]:
+    workout_id = _pos_int(body.get("workout_id"), "workout_id")
+    date = _date(body.get("date"), "date")
+    send = bool(body.get("send_to_watch"))
+    api = require_active()
+    with _api_lock:
+        name = _workout_name(api, workout_id)
+        preview = {"name": name, "workout_id": workout_id, "date": date, "send_to_watch": send}
+        if body.get("dry_run", True):
+            return {"status": "preview", "preview": preview}
+        sched = api.schedule_workout(workout_id, date) or {}
+        result: dict[str, Any] = {"status": "scheduled", "preview": preview, "scheduled_workout_id": sched.get("workoutScheduleId") or sched.get("id")}
+        if send:
+            try:
+                api.push_workout_to_device(workout_id)
+                result["sent_to_watch"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["send_error"] = translate(exc).message
+    return result
+
+
+def h_workouts_unschedule(body: dict[str, Any]) -> dict[str, Any]:
+    sid = _pos_int(body.get("scheduled_workout_id"), "scheduled_workout_id")
+    api = require_active()
+    with _api_lock:
+        try:
+            item = api.get_scheduled_workout_by_id(sid) or {}
+        except Exception as exc:  # noqa: BLE001
+            err = translate(exc)
+            if err.status in (401, 429):
+                raise err from exc
+            raise BridgeError(404, "not_found", f"No scheduled workout {sid}") from exc
+        preview = {
+            "scheduled_workout_id": sid,
+            "date": item.get("calendarDate") or item.get("date"),
+            "name": g(item, "workout", "workoutName") or item.get("title"),
+        }
+        if body.get("dry_run", True):
+            return {"status": "preview", "preview": preview}
+        api.unschedule_workout(sid)
+    return {"status": "unscheduled", "preview": preview}
+
+
+def h_workouts_delete(body: dict[str, Any]) -> dict[str, Any]:
+    workout_id = _pos_int(body.get("workout_id"), "workout_id")
+    api = require_active()
+    with _api_lock:
+        name = _workout_name(api, workout_id)
+        preview = {"workout_id": workout_id, "name": name}
+        if body.get("dry_run", True):
+            return {"status": "preview", "preview": preview}
+        api.delete_workout(workout_id)
+    return {"status": "deleted", "preview": preview}
+
+
+# ------------------------------------------------------------- weigh-ins ---
+
+def _weigh_ins(api: Garmin, start: str, end: str) -> list[dict[str, Any]]:
+    data = api.get_weigh_ins(start, end) or {}
+    out = []
+    for day in data.get("dailyWeightSummaries") or []:
+        for m in (day or {}).get("allWeightMetrics") or []:
+            if not isinstance(m, dict):
+                continue
+            grams = num(m.get("weight"))
+            out.append({
+                "weight_pk": m.get("samplePk"),
+                "date": m.get("calendarDate") or day.get("summaryDate"),
+                "time_local": m.get("date"),
+                "weight_kg": round(grams / 1000, 2) if grams else None,
+                "bmi": num(m.get("bmi")),
+                "body_fat_pct": num(m.get("bodyFat")),
+                "muscle_mass_kg": round(num(m.get("muscleMass")) / 1000, 2) if num(m.get("muscleMass")) else None,
+                "source": m.get("sourceType"),
+            })
+    return sorted(out, key=lambda w: (str(w["date"]), str(w["time_local"])), reverse=True)
+
+
+def h_weight_list(body: dict[str, Any]) -> dict[str, Any]:
+    start, end = _date(body.get("start"), "start"), _date(body.get("end"), "end")
+    api = require_active()
+    with _api_lock:
+        return {"weigh_ins": _weigh_ins(api, start, end)}
+
+
+def h_weight_add(body: dict[str, Any]) -> dict[str, Any]:
+    weight = _pos_num(body.get("weight_kg"), "weight_kg", 25, 300)
+    date = _date(body.get("date"), "date")
+    tm = body.get("time") or "07:00"
+    if not isinstance(tm, str) or not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", tm):
+        raise BridgeError(400, "bad_request", "time must be HH:MM (24-hour)")
+    stamp = f"{date}T{tm}:00"
+    preview = {"weight_kg": round(weight, 2), "date": date, "time": tm, "timezone": os.environ.get("TZ", "system")}
+    if body.get("dry_run", True):
+        return {"status": "preview", "preview": preview}
+    api = require_active()
+    with _api_lock:
+        # Naive local timestamp: the bridge runs with TZ set to the owner's zone,
+        # so the library derives the correct GMT time from it.
+        api.add_weigh_in(round(weight, 2), unitKey="kg", timestamp=stamp)
+    return {"status": "logged", "preview": preview}
+
+
+def h_weight_delete(body: dict[str, Any]) -> dict[str, Any]:
+    pk = _pos_int(body.get("weight_pk"), "weight_pk")
+    date = _date(body.get("date"), "date")
+    api = require_active()
+    with _api_lock:
+        match = next((w for w in _weigh_ins(api, date, date) if w.get("weight_pk") == pk), None)
+        if match is None:
+            raise BridgeError(404, "not_found", f"No weigh-in {pk} on {date}")
+        if body.get("dry_run", True):
+            return {"status": "preview", "preview": match}
+        api.delete_weigh_in(str(pk), date)
+    return {"status": "deleted", "preview": match}
+
+
 ROUTES = {
     "/status": h_status,
     "/session/load": h_load,
@@ -383,6 +833,14 @@ ROUTES = {
     "/login/mfa": h_login_mfa,
     "/daily": h_daily,
     "/activities": h_activities,
+    "/workouts/list": h_workouts_list,
+    "/workouts/create": h_workouts_create,
+    "/workouts/schedule": h_workouts_schedule,
+    "/workouts/unschedule": h_workouts_unschedule,
+    "/workouts/delete": h_workouts_delete,
+    "/weight/list": h_weight_list,
+    "/weight/add": h_weight_add,
+    "/weight/delete": h_weight_delete,
 }
 
 

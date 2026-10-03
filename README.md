@@ -7,6 +7,7 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 - **Garmin** — Garmin's official Health API is partner-only, so this uses the unofficial Garmin Connect API via [python-garminconnect](https://github.com/cyberjunky/python-garminconnect), run as a localhost-only Python sidecar (`garmin/bridge.py`) supervised by the Node server. Unofficial means it can break when Garmin changes things; redeploying picks up library fixes (`garmin/requirements.txt` allows minor updates).
 - **WHOOP** — kept as a read-only archive in the same SQLite volume. No automatic WHOOP pulls unless `WHOOP_SYNC=on`.
 - **Sign-in** — the connector's OAuth flow shows a sign-in page on this server: Garmin email, password, and Garmin's verification code if MFA is on. The password is relayed to Garmin and never stored. The server binds to the first (owner) Garmin account and refuses any other.
+- **Writes** — workout and weigh-in tools are two-step: without `confirm: true` they validate and return a preview, saving nothing; Claude shows it, then confirms. Exercise names are matched to Garmin's catalogue (case/hyphen-insensitive); unclear names return choices rather than a guess.
 - **Storage** — Garmin tokens are AES-GCM encrypted in SQLite (same key as before). Daily metrics are stored normalised plus Garmin's raw JSON per source.
 
 ## MCP tools
@@ -20,6 +21,13 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `garmin_raw` | Garmin's raw JSON for one date/source (`summary`, `sleep`, `hrv`, `readiness`, `training_status`) |
 | `garmin_sync` | Refresh now, or `days>7` for a paced background backfill |
 | `garmin_auth_url` | Link to reconnect Garmin |
+| `garmin_workouts` | Workout library + upcoming calendar entries (with ids) |
+| `garmin_create_strength_workout` | Build a strength workout (sets × reps @ kg, rest); optional schedule date / send to watch |
+| `garmin_create_run_workout` | Build a structured run (warmup/intervals/recovery/cooldown, pace or HR-zone targets, repeats) |
+| `garmin_schedule_workout` | Put a library workout on a calendar date |
+| `garmin_remove_workout` | Unschedule one date, or delete from the library |
+| `garmin_weigh_ins` | Weigh-ins (weight, BMI, body fat) |
+| `garmin_log_weight` / `garmin_delete_weight` | Add or remove a weigh-in |
 | `whoop_latest`, `whoop_recovery_trends`, `whoop_sleep_analysis`, `whoop_strain_history`, `whoop_records`, `whoop_profile` | WHOOP archive |
 | `whoop_sync` | Pull remaining WHOOP data while the WHOOP grant still works |
 

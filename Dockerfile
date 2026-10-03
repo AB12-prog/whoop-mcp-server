@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Build tools for better-sqlite3, plus Python (3.13 on trixie) for the Garmin bridge
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends python3 python3-venv make g++ ca-certificates \
+	&& apt-get install -y --no-install-recommends python3 python3-venv make g++ ca-certificates tzdata \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Garmin bridge dependencies in an isolated venv
