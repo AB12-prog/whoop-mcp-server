@@ -1373,6 +1373,7 @@ def h_workouts_list(body: dict[str, Any]) -> dict[str, Any]:
         limit = _pos_int(body.get("limit", 30), "limit", 1, 100)
         library = api.get_workouts(0, limit) or []
         scheduled: list[dict[str, Any]] = []
+        seen: set[Any] = set()  # month views overlap at the edges (late Oct shows in Nov too)
         for pair in months[:3]:
             if not (isinstance(pair, list) and len(pair) == 2):
                 continue
@@ -1380,6 +1381,9 @@ def h_workouts_list(body: dict[str, Any]) -> dict[str, Any]:
             items = g(api.get_scheduled_workouts(year, month), "calendarItems") or []
             for it in items:
                 if isinstance(it, dict) and it.get("itemType") == "workout":
+                    if it.get("id") in seen:
+                        continue
+                    seen.add(it.get("id"))
                     scheduled.append({
                         "scheduled_workout_id": it.get("id"),
                         "workout_id": it.get("workoutId"),
