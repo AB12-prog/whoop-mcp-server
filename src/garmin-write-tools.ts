@@ -305,14 +305,14 @@ export async function handleGarminWriteTool(
 					: '- Nothing scheduled';
 				out += `\n\n## Library (most recent ${limit})\n`;
 				out += r.library.length
-					? r.library.map(w => `- ${w.name} (${w.sport ?? '—'}) · workout id ${w.workout_id}`).join('\n')
+					? r.library.map(w => `- ${w.name} (${w.sport ?? 'no sport set'}) · workout id ${w.workout_id}`).join('\n')
 					: '- Library is empty';
 				return text(out);
 			}
 
 			case 'garmin_workout_detail': {
 				const r = await bridge.call<Preview>('/workouts/detail', { workout_id: args.workout_id });
-				let out = `# ${r.name ?? 'Workout'} (${r.sport ?? 'workout'}) · workout id ${r.workout_id}\n`;
+				let out = `# ${r.name ?? 'Workout'} (${r.sport ?? 'no sport set'}) · workout id ${r.workout_id}\n`;
 				if (r.description) out += `\n${r.description}\n`;
 				if (typeof r.pool_length_m === 'number') out += `\nPool length: ${r.pool_length_m} m\n`;
 				out += '\n';

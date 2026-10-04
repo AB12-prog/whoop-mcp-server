@@ -35,7 +35,7 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `garmin_workouts` | Workout library (any sport) + upcoming calendar entries (with ids) |
 | `garmin_workout_detail` | Read one workout step by step — exercises, loads, durations, targets, repeats, notes |
 | `garmin_create_strength_workout` | Build a strength workout (sets × reps or timed sets, @ kg, rest); optional schedule date / send to watch; `workout_id` replaces one in place |
-| `garmin_create_workout` | Build a structured workout for any sport — bike, run, walk, hike, pool swim, cardio machines (rower, elliptical, stairs), HIIT, yoga, pilates, mobility; HR zone/bpm, pace, speed, power or cadence targets; repeats; `workout_id` replaces one in place |
+| `garmin_create_workout` | Build a structured workout for any sport — bike, run, walk and hike (saved as Garmin "Other"), pool swim, cardio machines (rower, elliptical, stairs), HIIT, yoga, pilates, mobility; HR zone/bpm, pace, speed, power or cadence targets; repeats; `workout_id` replaces one in place |
 | `garmin_create_run_workout` | Same as `garmin_create_workout` with sport "running" |
 | `garmin_schedule_workout` | Put a library workout on a calendar date |
 | `garmin_remove_workout` | Unschedule one date, or delete from the library |

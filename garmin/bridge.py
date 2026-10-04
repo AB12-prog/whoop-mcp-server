@@ -853,8 +853,11 @@ SPORTS: dict[str, tuple[int, str, int, str]] = {
     "pilates": (SportType.PILATES, "pilates", 8, "Pilates"),
     "hiit": (SportType.HIIT, "hiit", 9, "HIIT"),
     "mobility": (SportType.MOBILITY, "mobility", 11, "Mobility"),
-    "walking": (17, "walking", 17, "Walk"),
-    "hiking": (18, "hiking", 18, "Hike"),
+    # Garmin's workout service ignores the activity ids for walking (17) and
+    # hiking (18) and saves the workout with no sport, so these are filed as
+    # "other" workouts; pace targets still apply.
+    "walking": (SportType.OTHER, "other", 3, "Walk"),
+    "hiking": (SportType.OTHER, "other", 3, "Hike"),
 }
 # Everyday names. Machines without a workout type of their own (rower,
 # elliptical, stair climber, ski erg) are Garmin "cardio" workouts.
