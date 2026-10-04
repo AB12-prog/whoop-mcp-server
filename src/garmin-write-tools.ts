@@ -1,4 +1,4 @@
-// src/garmin-write-tools.ts — Garmin workout and weigh-in tools.
+// src/garmin-write-tools.ts — Garmin workout (any sport) and weigh-in tools.
 //
 // Every write is two-step: called without `confirm: true` it validates
 // everything and returns a preview without touching Garmin; called again with
@@ -21,6 +21,49 @@ const scheduleProps = {
 	send_to_watch: { type: 'boolean', description: 'Optional: also push it to the watch right away.' },
 };
 
+const lowHigh = (unit: string) => ({
+	type: 'object',
+	description: `Range in ${unit}: {"low": …, "high": …}`,
+	properties: { low: { type: 'number' }, high: { type: 'number' } },
+});
+
+const stepProperties = {
+	type: { type: 'string', enum: ['warmup', 'interval', 'recovery', 'rest', 'cooldown', 'other', 'repeat'] },
+	duration_s: { type: 'number', description: 'Ends after this many seconds.' },
+	distance_m: { type: 'number', description: 'Ends after this distance in metres.' },
+	reps: { type: 'number', description: 'Ends after this many reps (needs exercise).' },
+	calories: { type: 'number', description: 'Ends after this many kcal.' },
+	lap_button: { type: 'boolean', description: 'true = open-ended, ends when you press lap.' },
+	exercise: { type: 'string', description: "Optional exercise from Garmin's catalogue (cardio, HIIT, yoga, pilates, mobility, strength, other)." },
+	weight_kg: { type: 'number', description: 'Optional load in kg for an exercise step.' },
+	hr_zone: { type: 'number', description: 'Target heart-rate zone 1–5 (as configured on the watch).' },
+	hr_bpm: lowHigh('bpm'),
+	pace: {
+		type: 'object',
+		description: 'Running/walking/hiking pace range per km, e.g. {"fast":"4:50","slow":"5:10"}.',
+		properties: { fast: { type: 'string' }, slow: { type: 'string' } },
+	},
+	speed_kmh: lowHigh('km/h'),
+	power_zone: { type: 'number', description: 'Target power zone 1–7.' },
+	power_w: lowHigh('watts'),
+	cadence: lowHigh('rpm (spm for run/walk/hike)'),
+	notes: { type: 'string', description: 'Optional note shown on the watch for this step (max 200 characters).' },
+	times: { type: 'number', description: 'repeat only: 2–99' },
+};
+
+const stepsSchema = {
+	type: 'array',
+	description: 'Steps in order. One target per step at most.',
+	items: {
+		type: 'object',
+		properties: {
+			...stepProperties,
+			steps: { type: 'array', description: 'repeat only: the steps to repeat', items: { type: 'object', properties: stepProperties, required: ['type'] } },
+		},
+		required: ['type'],
+	},
+};
+
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
 const READ = { readOnlyHint: true, openWorldHint: true };
@@ -28,14 +71,28 @@ const READ = { readOnlyHint: true, openWorldHint: true };
 export const garminWriteToolDefs = [
 	{
 		name: 'garmin_workouts',
-		description: 'List workouts in the Garmin workout library and those scheduled on the Garmin calendar (this month and next two). Returns the ids the other workout tools need.',
-		inputSchema: { type: 'object', properties: {}, required: [] },
+		description: 'List workouts in the Garmin workout library (any sport) and those scheduled on the Garmin calendar (this month and next two). Returns the ids the other workout tools need. Use garmin_workout_detail to read one workout step by step.',
+		inputSchema: {
+			type: 'object',
+			properties: { limit: { type: 'number', description: 'Library workouts to list, most recent first (default 30, max 100).' } },
+			required: [],
+		},
+		annotations: READ,
+	},
+	{
+		name: 'garmin_workout_detail',
+		description: 'Read one library workout of any sport step by step: step types, durations/distances/reps, exercises, loads (kg), HR/pace/speed/power/cadence targets, repeats and notes.',
+		inputSchema: {
+			type: 'object',
+			properties: { workout_id: { type: 'number', description: 'From garmin_workouts (library).' } },
+			required: ['workout_id'],
+		},
 		annotations: READ,
 	},
 	{
 		name: 'garmin_create_strength_workout',
 		description:
-			"Create a strength workout in Garmin Connect (optionally schedule it / send to the watch). Exercise names must match Garmin's catalogue; case, spacing and hyphens are forgiven, and an unclear name returns the closest catalogue names to choose from. Two-step: preview first, then confirm.",
+			"Create a strength workout in Garmin Connect (optionally schedule it / send to the watch), or replace an existing one in place with workout_id (keeps its calendar dates). Each exercise is sets × reps (or sets × duration_s for holds like planks) with optional load in kg. Exercise names must match Garmin's catalogue; case, spacing and hyphens are forgiven, and an unclear name returns the closest catalogue names to choose from. Two-step: preview first, then confirm.",
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -43,19 +100,21 @@ export const garminWriteToolDefs = [
 				description: { type: 'string' },
 				exercises: {
 					type: 'array',
-					description: 'In order. Each block = sets of reps with rest after each set.',
+					description: 'In order. Each block = sets of reps (or timed sets) with rest after each set.',
 					items: {
 						type: 'object',
 						properties: {
-							exercise: { type: 'string', description: 'e.g. "Barbell Back Squat", "Bench Press", "Pull-up", "Romanian Deadlift".' },
+							exercise: { type: 'string', description: 'e.g. "Barbell Back Squat", "Bench Press", "Pull-up", "Romanian Deadlift", "Plank".' },
 							sets: { type: 'number', description: '1–20 (default 3)' },
-							reps: { type: 'number', description: '1–200 (default 10)' },
-							weight_kg: { type: 'number', description: 'Optional target load in kg.' },
+							reps: { type: 'number', description: '1–200 (default 10). Omit when using duration_s.' },
+							duration_s: { type: 'number', description: 'Timed sets instead of reps, 5–3600 s (e.g. a 45 s plank).' },
+							weight_kg: { type: 'number', description: 'Optional target load in kg (0–500).' },
 							rest_seconds: { type: 'number', description: '0–900 (default 90)' },
 						},
 						required: ['exercise'],
 					},
 				},
+				workout_id: { type: 'number', description: 'Optional: replace this existing library workout in place instead of creating a new one. Its calendar dates stay.' },
 				...scheduleProps,
 				...confirmProp,
 			},
@@ -64,34 +123,40 @@ export const garminWriteToolDefs = [
 		annotations: WRITE,
 	},
 	{
+		name: 'garmin_create_workout',
+		description:
+			'Create a structured workout for ANY sport in Garmin Connect — cycling (indoor or outdoor), running, walking, hiking, pool swimming, cardio machines (rowing, elliptical, stairs, ski erg), HIIT, yoga, pilates, mobility or other — optionally scheduling it / sending it to the watch, or replace an existing one in place with workout_id (keeps its calendar dates). Steps: warmup, interval, recovery, rest, cooldown, other — each ends after duration_s, distance_m, reps (with an exercise), calories, or lap_button. Optional target per step: hr_zone, hr_bpm, pace (run/walk/hike), speed_kmh, power_zone, power_w, or cadence. Use {type:"repeat", times, steps:[...]} for intervals (one level). Two-step: preview first, then confirm.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				sport: {
+					type: 'string',
+					description:
+						'running, cycling, walking, hiking, swimming, cardio_training, hiit, yoga, pilates, mobility, strength_training or other. Aliases: bike, indoor_cycling, spin, treadmill, rowing, rower, elliptical, stairs, ski_erg, walk, hike, swim.',
+				},
+				name: { type: 'string', description: 'Workout name, max 80 characters.' },
+				description: { type: 'string' },
+				pool_length_m: { type: 'number', description: 'Swimming only: pool length in metres (default 25).' },
+				steps: stepsSchema,
+				workout_id: { type: 'number', description: 'Optional: replace this existing library workout in place instead of creating a new one. Its calendar dates stay.' },
+				...scheduleProps,
+				...confirmProp,
+			},
+			required: ['sport', 'name', 'steps'],
+		},
+		annotations: WRITE,
+	},
+	{
 		name: 'garmin_create_run_workout',
 		description:
-			'Create a structured run workout in Garmin Connect (optionally schedule it / send to the watch). Steps: warmup, interval, recovery, rest, cooldown — each with duration_s OR distance_m, and optional target pace range (min:sec per km) OR hr_zone 1–5. Use {type:"repeat", times, steps:[...]} for intervals (one level). Two-step: preview first, then confirm.',
+			'Create a structured run workout in Garmin Connect (same as garmin_create_workout with sport "running"). Steps: warmup, interval, recovery, rest, cooldown — each with duration_s, distance_m or lap_button, and an optional target (pace range min:sec per km, hr_zone, hr_bpm, speed_kmh, power or cadence). Use {type:"repeat", times, steps:[...]} for intervals (one level). workout_id replaces an existing workout in place. Two-step: preview first, then confirm.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				name: { type: 'string', description: 'Workout name, max 80 characters.' },
 				description: { type: 'string' },
-				steps: {
-					type: 'array',
-					items: {
-						type: 'object',
-						properties: {
-							type: { type: 'string', enum: ['warmup', 'interval', 'recovery', 'rest', 'cooldown', 'repeat'] },
-							duration_s: { type: 'number' },
-							distance_m: { type: 'number' },
-							pace: {
-								type: 'object',
-								description: 'Target pace range per km, e.g. {"fast":"4:50","slow":"5:10"}.',
-								properties: { fast: { type: 'string' }, slow: { type: 'string' } },
-							},
-							hr_zone: { type: 'number', description: 'Heart-rate zone 1–5 (as configured on the watch).' },
-							times: { type: 'number', description: 'repeat only: 2–50' },
-							steps: { type: 'array', description: 'repeat only: the steps to repeat', items: { type: 'object' } },
-						},
-						required: ['type'],
-					},
-				},
+				steps: stepsSchema,
+				workout_id: { type: 'number', description: 'Optional: replace this existing library workout in place. Its calendar dates stay.' },
 				...scheduleProps,
 				...confirmProp,
 			},
@@ -189,7 +254,8 @@ interface BridgeWriteResult {
 }
 
 function workoutPreviewText(p: Preview): string {
-	let out = `**${p.kind === 'run' ? 'Run' : 'Strength'} workout: ${p.name}**\n`;
+	let out = `**${p.label ?? (p.kind === 'run' ? 'Run' : 'Strength')} workout: ${p.name}**\n`;
+	if (p.replace_workout_id) out += `_Replaces "${p.replace_name ?? 'workout'}" (id ${p.replace_workout_id}) in place — its calendar dates stay._\n`;
 	for (const line of (p.steps as string[]) ?? []) out += `- ${line}\n`;
 	if (p.schedule_date) out += `\nScheduled for: ${p.schedule_date}`;
 	if (p.send_to_watch) out += `\nSend to watch: yes`;
@@ -228,31 +294,48 @@ export async function handleGarminWriteTool(
 	try {
 		switch (name) {
 			case 'garmin_workouts': {
-				const r = await bridge.call<{ library: Preview[]; scheduled: Preview[] }>('/workouts/list', { months: upcomingMonths() });
+				const lim = Number(args.limit ?? 30);
+				const limit = Number.isFinite(lim) ? Math.min(Math.max(Math.trunc(lim), 1), 100) : 30;
+				const r = await bridge.call<{ library: Preview[]; scheduled: Preview[] }>('/workouts/list', { months: upcomingMonths(), limit });
 				const today = localDate(0);
 				const upcoming = r.scheduled.filter(s => String(s.date ?? '') >= today);
 				let out = '# Garmin workouts\n\n## Scheduled (today onward)\n';
 				out += upcoming.length
 					? upcoming.map(s => `- ${s.date} — ${s.name} (${s.sport ?? 'workout'}) · scheduled id ${s.scheduled_workout_id}, workout id ${s.workout_id}`).join('\n')
 					: '- Nothing scheduled';
-				out += '\n\n## Library (most recent 30)\n';
+				out += `\n\n## Library (most recent ${limit})\n`;
 				out += r.library.length
 					? r.library.map(w => `- ${w.name} (${w.sport ?? '—'}) · workout id ${w.workout_id}`).join('\n')
 					: '- Library is empty';
 				return text(out);
 			}
 
+			case 'garmin_workout_detail': {
+				const r = await bridge.call<Preview>('/workouts/detail', { workout_id: args.workout_id });
+				let out = `# ${r.name ?? 'Workout'} (${r.sport ?? 'workout'}) · workout id ${r.workout_id}\n`;
+				if (r.description) out += `\n${r.description}\n`;
+				if (typeof r.pool_length_m === 'number') out += `\nPool length: ${r.pool_length_m} m\n`;
+				out += '\n';
+				const steps = (r.steps as string[]) ?? [];
+				out += steps.length ? steps.map(l => `- ${l}`).join('\n') : '- No steps';
+				return text(out);
+			}
+
 			case 'garmin_create_strength_workout':
-			case 'garmin_create_run_workout': {
-				const kind = name === 'garmin_create_strength_workout' ? 'strength' : 'run';
+			case 'garmin_create_run_workout':
+			case 'garmin_create_workout': {
+				const kind = name === 'garmin_create_strength_workout' ? 'strength' : name === 'garmin_create_run_workout' ? 'run' : 'sport';
 				const r = await bridge.call<BridgeWriteResult>(
 					'/workouts/create',
 					{
 						kind,
+						sport: args.sport,
 						name: args.name,
 						description: args.description,
 						exercises: args.exercises,
 						steps: args.steps,
+						pool_length_m: args.pool_length_m,
+						workout_id: args.workout_id,
 						schedule_date: args.schedule_date,
 						send_to_watch: args.send_to_watch === true,
 						dry_run: dryRun,
@@ -260,6 +343,9 @@ export async function handleGarminWriteTool(
 					120_000
 				);
 				if (r.status === 'preview') return text(`${workoutPreviewText(r.preview)}${PREVIEW_FOOTER}`);
+				if (r.status === 'updated') {
+					return text(`✅ Replaced "${r.preview.replace_name ?? r.preview.name}" with "${r.preview.name}" in place (workout id ${r.workout_id}); its calendar dates are unchanged.${followOns(r)}`);
+				}
 				return text(`✅ Created "${r.preview.name}" in Garmin Connect (workout id ${r.workout_id}).${followOns(r)}`);
 			}
 

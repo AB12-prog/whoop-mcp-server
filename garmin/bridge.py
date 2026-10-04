@@ -39,16 +39,16 @@ from garminconnect import (
     exercises,
 )
 from garminconnect.workout import (
+    BaseWorkout,
     ConditionType,
     ExecutableStep,
-    RunningWorkout,
     SportType,
     StepType,
     StrengthWorkout,
     TargetType,
     WorkoutSegment,
     create_repeat_group,
-    create_strength_set,
+    create_strength_rest_step,
 )
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="[garmin-bridge] %(levelname)s %(message)s")
@@ -824,14 +824,54 @@ def h_profile(body: dict[str, Any]) -> dict[str, Any]:
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PACE_RE = re.compile(r"^(\d{1,2}):([0-5]\d)$")
 NO_TARGET = {"workoutTargetTypeId": TargetType.NO_TARGET, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
-RUN_STEP_TYPES = {
+STEP_TYPES = {
     "warmup": (StepType.WARMUP, "warmup", 1),
     "cooldown": (StepType.COOLDOWN, "cooldown", 2),
     "interval": (StepType.INTERVAL, "interval", 3),
     "recovery": (StepType.RECOVERY, "recovery", 4),
     "rest": (StepType.REST, "rest", 5),
+    "other": (StepType.OTHER, "other", 7),
 }
 MAX_STEPS = 60
+
+# Garmin reads a step's weightValue in the unit named by weightUnit (kg here).
+# garminconnect 0.3.x multiplies kg by 1000 first ("grams"), which Garmin then
+# shows as tonnes, so strength steps are built here instead of with
+# create_strength_set(weight_kg=...).
+WEIGHT_UNIT_KG = {"unitId": 8, "unitKey": "kilogram", "factor": 1000.0}
+
+# Workout sport types (ids from /workout-service/workout/types):
+# key -> (sportTypeId, sportTypeKey, displayOrder, label)
+SPORTS: dict[str, tuple[int, str, int, str]] = {
+    "running": (SportType.RUNNING, "running", 1, "Run"),
+    "cycling": (SportType.CYCLING, "cycling", 2, "Bike"),
+    "other": (SportType.OTHER, "other", 3, "Other"),
+    "swimming": (SportType.SWIMMING, "swimming", 3, "Pool swim"),
+    "strength_training": (SportType.STRENGTH_TRAINING, "strength_training", 5, "Strength"),
+    "cardio_training": (SportType.CARDIO_TRAINING, "cardio_training", 6, "Cardio"),
+    "yoga": (SportType.YOGA, "yoga", 7, "Yoga"),
+    "pilates": (SportType.PILATES, "pilates", 8, "Pilates"),
+    "hiit": (SportType.HIIT, "hiit", 9, "HIIT"),
+    "mobility": (SportType.MOBILITY, "mobility", 11, "Mobility"),
+    "walking": (17, "walking", 17, "Walk"),
+    "hiking": (18, "hiking", 18, "Hike"),
+}
+# Everyday names. Machines without a workout type of their own (rower,
+# elliptical, stair climber, ski erg) are Garmin "cardio" workouts.
+SPORT_ALIASES = {
+    "run": "running", "treadmill": "running", "trail_running": "running",
+    "bike": "cycling", "ride": "cycling", "cycle": "cycling", "indoor_cycling": "cycling", "spin": "cycling", "virtual_ride": "cycling",
+    "swim": "swimming", "pool_swim": "swimming", "lap_swimming": "swimming",
+    "strength": "strength_training",
+    "cardio": "cardio_training", "rowing": "cardio_training", "indoor_rowing": "cardio_training", "rower": "cardio_training",
+    "erg": "cardio_training", "elliptical": "cardio_training", "stair": "cardio_training", "stairs": "cardio_training",
+    "stair_climber": "cardio_training", "ski_erg": "cardio_training",
+    "walk": "walking", "hike": "hiking",
+}
+EXERCISE_SPORTS = {"cardio_training", "hiit", "yoga", "pilates", "mobility", "other", "strength_training"}
+PACE_SPORTS = {"running", "walking", "hiking"}
+TARGET_KEYS = ("hr_zone", "hr_bpm", "pace", "speed_kmh", "power_zone", "power_w", "cadence")
+END_KEYS = ("duration_s", "distance_m", "reps", "calories", "lap_button")
 
 
 def _date(value: Any, field: str) -> str:
@@ -892,6 +932,38 @@ def _resolve_exercise(name: Any) -> dict[str, str]:
     raise BridgeError(400, "unknown_exercise", f'"{raw}" is not in Garmin\'s exercise catalogue.{hint}')
 
 
+INTERVAL_STEP = {"stepTypeId": StepType.INTERVAL, "stepTypeKey": "interval", "displayOrder": 3}
+COND_REPS = {"conditionTypeId": ConditionType.REPS, "conditionTypeKey": "reps", "displayOrder": 10, "displayable": True}
+COND_TIME = {"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}
+COND_DISTANCE = {"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}
+COND_CALORIES = {"conditionTypeId": ConditionType.CALORIES, "conditionTypeKey": "calories", "displayOrder": 4, "displayable": True}
+COND_LAP = {"conditionTypeId": ConditionType.LAP_BUTTON, "conditionTypeKey": "lap.button", "displayOrder": 1, "displayable": True}
+
+
+def _weight_fields(weight_kg: float | None) -> dict[str, Any]:
+    if weight_kg is None:
+        return {}
+    return {"weightValue": round(float(weight_kg), 2), "weightUnit": dict(WEIGHT_UNIT_KG)}
+
+
+def _strength_block(ex: dict[str, str], order: int, sets: int, reps: int | None, duration: float | None,
+                    rest: float, weight_kg: float | None) -> Any:
+    """One "N sets" block: a repeat group of [exercise, rest]. Takes stepOrder
+    order..order+2, like garminconnect's create_strength_set."""
+    end, value = (COND_REPS, float(reps)) if duration is None else (COND_TIME, float(duration))
+    exercise = ExecutableStep(
+        stepOrder=order + 1,
+        stepType=INTERVAL_STEP,
+        endCondition=end,
+        endConditionValue=value,
+        targetType=NO_TARGET,
+        category=ex["category"],
+        exerciseName=ex["exercise"],
+        **_weight_fields(weight_kg),
+    )
+    return create_repeat_group(sets, [exercise, create_strength_rest_step(rest, order + 2)], order)
+
+
 def _build_strength(body: dict[str, Any]) -> tuple[StrengthWorkout, list[str]]:
     items = body.get("exercises")
     if not isinstance(items, list) or not items:
@@ -906,14 +978,18 @@ def _build_strength(body: dict[str, Any]) -> tuple[StrengthWorkout, list[str]]:
             raise BridgeError(400, "bad_request", f"exercise {i} must be an object")
         ex = _resolve_exercise(item.get("exercise"))
         sets = _pos_int(item.get("sets", 3), f"exercise {i} sets", 1, 20)
-        reps = _pos_int(item.get("reps", 10), f"exercise {i} reps", 1, 200)
+        if item.get("duration_s") is not None and item.get("reps") is not None:
+            raise BridgeError(400, "bad_request", f"exercise {i}: use reps or duration_s, not both")
+        duration = None if item.get("duration_s") is None else _pos_num(item["duration_s"], f"exercise {i} duration_s", 5, 3600)
+        reps = None if duration is not None else _pos_int(item.get("reps", 10), f"exercise {i} reps", 1, 200)
         rest = _pos_num(item.get("rest_seconds", 90), f"exercise {i} rest_seconds", 0, 900)
         weight = item.get("weight_kg")
         weight_kg = None if weight is None else _pos_num(weight, f"exercise {i} weight_kg", 0, 500)
-        steps.append(create_strength_set(ex["category"], order, sets, reps, rest, exercise_name=ex["exercise"], weight_kg=weight_kg))
+        steps.append(_strength_block(ex, order, sets, reps, duration, rest, weight_kg))
         order += 3
         load = f" @ {weight_kg:g} kg" if weight_kg is not None else ""
-        lines.append(f"{i}. {ex['name']} — {sets} × {reps}{load}, rest {_fmt_secs(rest)}")
+        amount = f"{reps}" if duration is None else _fmt_secs(duration)
+        lines.append(f"{i}. {ex['name']} — {sets} × {amount}{load}, rest {_fmt_secs(rest)}")
     workout = StrengthWorkout(
         workoutName=body["name"],
         description=body.get("description") or None,
@@ -950,91 +1026,175 @@ def _pace_mps(value: Any, field: str) -> float:
     return 1000 / secs
 
 
-def _run_step(step: Any, order: _Order, depth: int, lines: list[str], indent: str) -> Any:
+def _resolve_sport(value: Any) -> str:
+    key = re.sub(r"[\s\-]+", "_", str(value or "").strip().lower())
+    key = SPORT_ALIASES.get(key, key)
+    if key not in SPORTS:
+        names = ", ".join(sorted(SPORTS))
+        raise BridgeError(400, "bad_request", f"sport must be one of: {names} (aliases such as bike, rowing, elliptical, walk and hike also work)")
+    return key
+
+
+def _target(type_id: int, key: str) -> dict[str, Any]:
+    return {"workoutTargetTypeId": type_id, "workoutTargetTypeKey": key, "displayOrder": 1}
+
+
+def _low_high(value: Any, field: str, lo: float, hi: float) -> tuple[float, float]:
+    if not isinstance(value, dict):
+        raise BridgeError(400, "bad_request", f'{field} must be {{"low": …, "high": …}}')
+    a = _pos_num(value.get("low"), f"{field}.low", lo, hi)
+    b = _pos_num(value.get("high"), f"{field}.high", lo, hi)
+    if a > b:
+        raise BridgeError(400, "bad_request", f"{field}.low must be at or below {field}.high")
+    return a, b
+
+
+def _parse_target(step: dict[str, Any], kind: str, sport: str) -> tuple[dict[str, Any], str]:
+    given = [k for k in TARGET_KEYS if step.get(k) is not None]
+    if len(given) > 1:
+        raise BridgeError(400, "bad_request", f"{kind} step: use one target per step (got {', '.join(given)})")
+    if not given:
+        return {"targetType": NO_TARGET}, ""
+    key, value = given[0], step[given[0]]
+    if key == "hr_zone":
+        z = _pos_int(value, "hr_zone", 1, 5)
+        return {"targetType": _target(TargetType.HEART_RATE_ZONE, "heart.rate.zone"), "zoneNumber": z}, f" in HR zone {z}"
+    if key == "hr_bpm":
+        a, b = _low_high(value, "hr_bpm", 40, 230)
+        return {"targetType": _target(TargetType.HEART_RATE_ZONE, "heart.rate.zone"), "targetValueOne": a, "targetValueTwo": b}, f" at {a:g}–{b:g} bpm"
+    if key == "pace":
+        if sport not in PACE_SPORTS:
+            raise BridgeError(400, "bad_request", f"pace targets are for running, walking and hiking; on a {sport} workout use speed_kmh, power or heart rate")
+        if not isinstance(value, dict):
+            raise BridgeError(400, "bad_request", 'pace must be {"fast": "4:50", "slow": "5:10"}')
+        fast = _pace_mps(value.get("fast"), "pace.fast")
+        slow = _pace_mps(value.get("slow"), "pace.slow")
+        if fast < slow:
+            raise BridgeError(400, "bad_request", "pace.fast must be quicker than (or equal to) pace.slow")
+        return ({"targetType": _target(TargetType.PACE_ZONE, "pace.zone"), "targetValueOne": slow, "targetValueTwo": fast},
+                f" @ {value['fast']}–{value['slow']} /km")
+    if key == "speed_kmh":
+        a, b = _low_high(value, "speed_kmh", 1, 100)
+        return {"targetType": _target(TargetType.SPEED_ZONE, "speed.zone"), "targetValueOne": a / 3.6, "targetValueTwo": b / 3.6}, f" at {a:g}–{b:g} km/h"
+    if key == "power_zone":
+        z = _pos_int(value, "power_zone", 1, 7)
+        return {"targetType": _target(TargetType.POWER_ZONE, "power.zone"), "zoneNumber": z}, f" in power zone {z}"
+    if key == "power_w":
+        a, b = _low_high(value, "power_w", 20, 2500)
+        return {"targetType": _target(TargetType.POWER_ZONE, "power.zone"), "targetValueOne": a, "targetValueTwo": b}, f" at {a:g}–{b:g} W"
+    a, b = _low_high(value, "cadence", 10, 250)
+    unit = "spm" if sport in PACE_SPORTS else "rpm"
+    return {"targetType": _target(TargetType.CADENCE, "cadence"), "targetValueOne": a, "targetValueTwo": b}, f" at {a:g}–{b:g} {unit}"
+
+
+def _parse_end(step: dict[str, Any], kind: str, has_exercise: bool) -> tuple[dict[str, Any], float | None, str]:
+    given = [k for k in END_KEYS if step.get(k) is not None and step.get(k) is not False]
+    if len(given) != 1:
+        raise BridgeError(400, "bad_request", f"{kind} step needs exactly one of duration_s, distance_m, reps, calories or lap_button: true")
+    key = given[0]
+    if key == "duration_s":
+        value = _pos_num(step[key], f"{kind} duration_s", 5, 6 * 3600)
+        return COND_TIME, value, _fmt_secs(value)
+    if key == "distance_m":
+        value = _pos_num(step[key], f"{kind} distance_m", 10, 300_000)
+        return COND_DISTANCE, value, (f"{value / 1000:g} km" if value >= 1000 else f"{value:g} m")
+    if key == "reps":
+        if not has_exercise:
+            raise BridgeError(400, "bad_request", f"{kind} step: reps needs an exercise")
+        value = float(_pos_int(step[key], f"{kind} reps", 1, 500))
+        return COND_REPS, value, f"{int(value)} reps"
+    if key == "calories":
+        value = _pos_num(step[key], f"{kind} calories", 5, 5000)
+        return COND_CALORIES, value, f"{value:g} kcal"
+    if step[key] is not True:
+        raise BridgeError(400, "bad_request", f"{kind} step: lap_button must be true")
+    return COND_LAP, None, "until lap press"
+
+
+def _step(step: Any, order: _Order, depth: int, lines: list[str], indent: str, sport: str) -> Any:
     if not isinstance(step, dict):
         raise BridgeError(400, "bad_request", "each step must be an object")
     kind = step.get("type")
     if kind == "repeat":
         if depth >= 1:
             raise BridgeError(400, "bad_request", "repeats can't be nested inside repeats")
-        times = _pos_int(step.get("times"), "repeat times", 2, 50)
+        times = _pos_int(step.get("times"), "repeat times", 2, 99)
         inner = step.get("steps")
         if not isinstance(inner, list) or not inner:
             raise BridgeError(400, "bad_request", "a repeat needs a non-empty steps list")
         group_order = order.next()
         lines.append(f"{indent}Repeat {times}×:")
-        children = [_run_step(s, order, depth + 1, lines, indent + "   ") for s in inner]
+        children = [_step(s, order, depth + 1, lines, indent + "   ", sport) for s in inner]
         return create_repeat_group(times, children, group_order)
-    if kind not in RUN_STEP_TYPES:
-        raise BridgeError(400, "bad_request", f"step type must be one of: {', '.join([*RUN_STEP_TYPES, 'repeat'])}")
+    if kind not in STEP_TYPES:
+        raise BridgeError(400, "bad_request", f"step type must be one of: {', '.join([*STEP_TYPES, 'repeat'])}")
 
-    type_id, type_key, display = RUN_STEP_TYPES[kind]
-    dist, dur = step.get("distance_m"), step.get("duration_s")
-    if (dist is None) == (dur is None):
-        raise BridgeError(400, "bad_request", f"{kind} step needs exactly one of duration_s or distance_m")
-    if dist is not None:
-        value = _pos_num(dist, f"{kind} distance_m", 50, 100_000)
-        end = {"conditionTypeId": ConditionType.DISTANCE, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}
-        length = f"{value / 1000:g} km" if value >= 1000 else f"{value:g} m"
-    else:
-        value = _pos_num(dur, f"{kind} duration_s", 10, 6 * 3600)
-        end = {"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}
-        length = _fmt_secs(value)
+    type_id, type_key, display = STEP_TYPES[kind]
+    extra: dict[str, Any] = {}
+    ex_label = ""
+    if step.get("exercise") is not None:
+        if sport not in EXERCISE_SPORTS:
+            raise BridgeError(400, "bad_request", f"exercises go on cardio, HIIT, yoga, pilates, mobility, strength or other workouts, not {sport}")
+        ex = _resolve_exercise(step["exercise"])
+        extra.update(category=ex["category"], exerciseName=ex["exercise"])
+        ex_label = f" {ex['name']}"
+    end, value, length = _parse_end(step, kind, bool(ex_label))
+    load = ""
+    if step.get("weight_kg") is not None:
+        if not ex_label:
+            raise BridgeError(400, "bad_request", f"{kind} step: weight_kg needs an exercise")
+        w = _pos_num(step["weight_kg"], f"{kind} weight_kg", 0, 500)
+        extra.update(_weight_fields(w))
+        load = f" @ {w:g} kg"
+    target, tlabel = _parse_target(step, kind, sport)
+    notes = step.get("notes")
+    if notes is not None:
+        if not isinstance(notes, str) or len(notes) > 200:
+            raise BridgeError(400, "bad_request", f"{kind} step: notes must be text, max 200 characters")
+        notes = notes.strip()
+        if notes:
+            extra["description"] = notes
 
-    target: dict[str, Any] = {"targetType": NO_TARGET}
-    label = ""
-    pace, zone = step.get("pace"), step.get("hr_zone")
-    if pace is not None and zone is not None:
-        raise BridgeError(400, "bad_request", f"{kind} step: use pace or hr_zone, not both")
-    if pace is not None:
-        if not isinstance(pace, dict):
-            raise BridgeError(400, "bad_request", 'pace must be {"fast": "4:50", "slow": "5:10"}')
-        fast = _pace_mps(pace.get("fast"), "pace.fast")
-        slow = _pace_mps(pace.get("slow"), "pace.slow")
-        if fast < slow:
-            raise BridgeError(400, "bad_request", "pace.fast must be quicker than (or equal to) pace.slow")
-        target = {
-            "targetType": {"workoutTargetTypeId": TargetType.PACE_ZONE, "workoutTargetTypeKey": "pace.zone", "displayOrder": 1},
-            "targetValueOne": slow,
-            "targetValueTwo": fast,
-        }
-        label = f" @ {pace['fast']}–{pace['slow']} /km"
-    elif zone is not None:
-        z = _pos_int(zone, "hr_zone", 1, 5)
-        target = {
-            "targetType": {"workoutTargetTypeId": TargetType.HEART_RATE_ZONE, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 1},
-            "zoneNumber": z,
-        }
-        label = f" in HR zone {z}"
-
-    lines.append(f"{indent}{kind.capitalize()} {length}{label}")
-    return ExecutableStep(
-        stepOrder=order.next(),
-        stepType={"stepTypeId": type_id, "stepTypeKey": type_key, "displayOrder": display},
-        endCondition=end,
-        endConditionValue=value,
+    lines.append(f"{indent}{kind.capitalize()}{ex_label} {length}{load}{tlabel}" + (f" — {notes}" if notes else ""))
+    fields: dict[str, Any] = {
+        "stepOrder": order.next(),
+        "stepType": {"stepTypeId": type_id, "stepTypeKey": type_key, "displayOrder": display},
+        "endCondition": end,
         **target,
-    )
+        **extra,
+    }
+    if value is not None:
+        fields["endConditionValue"] = value
+    return ExecutableStep(**fields)
 
 
-def _build_run(body: dict[str, Any]) -> tuple[RunningWorkout, list[str]]:
+def _sport_type(sport: str) -> dict[str, Any]:
+    sid, key, disp, _ = SPORTS[sport]
+    return {"sportTypeId": sid, "sportTypeKey": key, "displayOrder": disp}
+
+
+def _build_sport(body: dict[str, Any], sport: str) -> tuple[BaseWorkout, list[str]]:
+    """Any-sport structured workout: timed/distance/rep/calorie/lap steps,
+    repeats, and HR, pace, speed, power or cadence targets."""
     steps = body.get("steps")
     if not isinstance(steps, list) or not steps:
         raise BridgeError(400, "bad_request", "steps must be a non-empty list")
     order = _Order()
     lines: list[str] = []
-    built = [_run_step(s, order, 0, lines, "") for s in steps]
-    workout = RunningWorkout(
+    built = [_step(s, order, 0, lines, "", sport) for s in steps]
+    extra: dict[str, Any] = {}
+    if sport == "swimming":
+        pool = _pos_num(body.get("pool_length_m", 25), "pool_length_m", 10, 100)
+        extra = {"poolLength": pool, "poolLengthUnit": {"unitId": 1, "unitKey": "meter", "factor": 100.0}}
+        lines.insert(0, f"Pool length {pool:g} m")
+    st = _sport_type(sport)
+    workout = BaseWorkout(
         workoutName=body["name"],
         description=body.get("description") or None,
         estimatedDurationInSecs=0,
-        workoutSegments=[
-            WorkoutSegment(
-                segmentOrder=1,
-                sportType={"sportTypeId": SportType.RUNNING, "sportTypeKey": "running"},
-                workoutSteps=built,
-            )
-        ],
+        sportType=st,
+        workoutSegments=[WorkoutSegment(segmentOrder=1, sportType=st, workoutSteps=built)],
+        **extra,
     )
     return workout, lines
 
@@ -1049,29 +1209,47 @@ def h_workouts_create(body: dict[str, Any]) -> dict[str, Any]:
         raise BridgeError(400, "bad_request", "description must be text, max 500 characters")
     schedule = _date(body["schedule_date"], "schedule_date") if body.get("schedule_date") else None
     send = bool(body.get("send_to_watch"))
+    replace_id = None if body.get("workout_id") is None else _pos_int(body.get("workout_id"), "workout_id")
 
     try:
         if kind == "strength":
+            sport = "strength_training"
             workout, lines = _build_strength(body)
-        elif kind == "run":
-            workout, lines = _build_run(body)
+        elif kind in ("run", "sport"):
+            sport = "running" if kind == "run" else _resolve_sport(body.get("sport"))
+            workout, lines = _build_sport(body, sport)
         else:
-            raise BridgeError(400, "bad_request", 'kind must be "strength" or "run"')
+            raise BridgeError(400, "bad_request", 'kind must be "strength", "run" or "sport"')
     except ValueError as exc:  # pydantic validation
         raise BridgeError(400, "bad_request", f"invalid workout: {str(exc)[:300]}") from exc
 
-    preview = {"kind": kind, "name": body["name"], "steps": lines, "schedule_date": schedule, "send_to_watch": send}
+    preview: dict[str, Any] = {
+        "kind": kind, "sport": sport, "label": SPORTS[sport][3], "name": body["name"], "steps": lines,
+        "schedule_date": schedule, "send_to_watch": send, "replace_workout_id": replace_id,
+    }
     if body.get("dry_run", True):
+        if replace_id:
+            api = require_active()
+            with _api_lock:
+                preview["replace_name"] = _workout_name(api, replace_id)
         return {"status": "preview", "preview": preview}
 
     api = require_active()
     with _api_lock:
-        created = api.upload_workout(workout.to_dict()) or {}
-        workout_id = created.get("workoutId")
-        if not workout_id:
-            raise BridgeError(502, "garmin_unavailable", "Garmin accepted the request but returned no workout id")
-        result: dict[str, Any] = {"status": "created", "workout_id": workout_id, "preview": preview}
-        # Follow-on steps report their own failure without hiding the created workout.
+        if replace_id:
+            preview["replace_name"] = _workout_name(api, replace_id)
+            # PUT replaces the whole workout but keeps its id, so calendar
+            # entries pointing at it stay where they are.
+            api.update_workout(replace_id, workout.to_dict())
+            workout_id = replace_id
+            result: dict[str, Any] = {"status": "updated", "workout_id": workout_id, "preview": preview}
+        else:
+            created = api.upload_workout(workout.to_dict()) or {}
+            workout_id = created.get("workoutId")
+            if not workout_id:
+                raise BridgeError(502, "garmin_unavailable", "Garmin accepted the request but returned no workout id")
+            result = {"status": "created", "workout_id": workout_id, "preview": preview}
+        # Follow-on steps report their own failure without hiding the saved workout.
         if schedule:
             try:
                 sched = api.schedule_workout(workout_id, schedule) or {}
@@ -1088,13 +1266,112 @@ def h_workouts_create(body: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# --- reading a workout back, any sport ---
+
+_EX_NAME_BY_KEY = {(e["category"], e["exercise"]): e["name"] for e in exercises.EXERCISES}
+
+
+def _pace_str(mps: float | None) -> str:
+    if not mps:
+        return "?"
+    secs = int(round(1000 / mps))
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def _describe_target(s: dict[str, Any], sport: str | None) -> str:
+    key = g(s, "targetType", "workoutTargetTypeKey")
+    if not key or key == "no.target":
+        return ""
+    z, a, b = s.get("zoneNumber"), num(s.get("targetValueOne")), num(s.get("targetValueTwo"))
+    has_range = a is not None and b is not None
+    if key == "heart.rate.zone":
+        return f" in HR zone {z}" if z else (f" at {a:g}–{b:g} bpm" if has_range else "")
+    if key == "power.zone":
+        return f" in power zone {z}" if z else (f" at {a:g}–{b:g} W" if has_range else "")
+    if key == "pace.zone" and has_range:
+        return f" @ {_pace_str(max(a, b))}–{_pace_str(min(a, b))} /km"
+    if key == "speed.zone" and has_range:
+        return f" at {a * 3.6:.1f}–{b * 3.6:.1f} km/h"
+    if key == "cadence" and has_range:
+        return f" at {a:g}–{b:g} {'spm' if sport in PACE_SPORTS else 'rpm'}"
+    return f" ({key})"
+
+
+def _describe_step(s: Any, indent: str, lines: list[str], sport: str | None) -> None:
+    if not isinstance(s, dict):
+        return
+    if s.get("type") == "RepeatGroupDTO" or g(s, "stepType", "stepTypeKey") == "repeat":
+        n = s.get("numberOfIterations") or num(s.get("endConditionValue"))
+        lines.append(f"{indent}Repeat {int(n) if n else '?'}×:")
+        for child in sorted(s.get("workoutSteps") or [], key=lambda c: (c or {}).get("stepOrder") or 0):
+            _describe_step(child, indent + "   ", lines, sport)
+        return
+    kind = str(g(s, "stepType", "stepTypeKey") or "step").capitalize()
+    ex = ""
+    if s.get("category"):
+        cat, exn = s.get("category"), s.get("exerciseName") or ""
+        ex = " " + (_EX_NAME_BY_KEY.get((cat, exn)) or str(exn or cat).replace("_", " ").title())
+    ck, v = g(s, "endCondition", "conditionTypeKey"), num(s.get("endConditionValue"))
+    if ck == "time" and v:
+        length = _fmt_secs(v)
+    elif ck == "distance" and v:
+        length = f"{v / 1000:g} km" if v >= 1000 else f"{v:g} m"
+    elif ck == "reps" and v:
+        length = f"{int(v)} reps"
+    elif ck == "calories" and v:
+        length = f"{int(v)} kcal"
+    elif ck == "lap.button":
+        length = "until lap press"
+    else:
+        length = str(ck or "")
+    load = ""
+    wv, unit = num(s.get("weightValue")), g(s, "weightUnit", "unitKey")
+    if wv:
+        load = f" @ {wv:g} {'kg' if unit == 'kilogram' else (unit or '')}".rstrip()
+    notes = s.get("description")
+    lines.append(f"{indent}{kind}{ex} {length}{load}{_describe_target(s, sport)}".rstrip() + (f" — {notes}" if notes else ""))
+
+
+def h_workouts_detail(body: dict[str, Any]) -> dict[str, Any]:
+    workout_id = _pos_int(body.get("workout_id"), "workout_id")
+    api = require_active()
+    with _api_lock:
+        try:
+            w = api.get_workout_by_id(workout_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            err = translate(exc)
+            if err.status in (401, 429):
+                raise err from exc
+            raise BridgeError(404, "not_found", f"No workout {workout_id} in your Garmin library") from exc
+    sport = g(w, "sportType", "sportTypeKey")
+    lines: list[str] = []
+    for seg in sorted(w.get("workoutSegments") or [], key=lambda x: (x or {}).get("segmentOrder") or 0):
+        seg_sport = g(seg, "sportType", "sportTypeKey") or sport
+        if len(w.get("workoutSegments") or []) > 1:
+            lines.append(f"Segment {seg.get('segmentOrder')} ({seg_sport}):")
+        for step in sorted(seg.get("workoutSteps") or [], key=lambda x: (x or {}).get("stepOrder") or 0):
+            _describe_step(step, "", lines, seg_sport)
+    pool = num(w.get("poolLength"))
+    return {
+        "workout_id": w.get("workoutId") or workout_id,
+        "name": w.get("workoutName"),
+        "sport": sport,
+        "description": w.get("description"),
+        "pool_length_m": pool,
+        "estimated_duration_s": num(w.get("estimatedDurationInSecs")),
+        "updated": w.get("updatedDate") or w.get("createdDate"),
+        "steps": lines,
+    }
+
+
 def h_workouts_list(body: dict[str, Any]) -> dict[str, Any]:
     api = require_active()
     months = body.get("months")
     if not isinstance(months, list) or not months:
         raise BridgeError(400, "bad_request", "months must be a list of [year, month]")
     with _api_lock:
-        library = api.get_workouts(0, 30) or []
+        limit = _pos_int(body.get("limit", 30), "limit", 1, 100)
+        library = api.get_workouts(0, limit) or []
         scheduled: list[dict[str, Any]] = []
         for pair in months[:3]:
             if not (isinstance(pair, list) and len(pair) == 2):
@@ -1670,6 +1947,7 @@ ROUTES = {
     "/workouts/schedule": h_workouts_schedule,
     "/workouts/unschedule": h_workouts_unschedule,
     "/workouts/delete": h_workouts_delete,
+    "/workouts/detail": h_workouts_detail,
     "/weight/list": h_weight_list,
     "/weight/add": h_weight_add,
     "/weight/delete": h_weight_delete,

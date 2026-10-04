@@ -32,9 +32,11 @@ A remote Model Context Protocol server that gives Claude your Garmin Connect hea
 | `garmin_query` | One read-only SQL `SELECT` over the whole database (separate read-only connection; credential tables refused; `gunzip_json(gz)` reads gzipped raw JSON) |
 | `garmin_sync` | Refresh now, or `days>7` for a resumable background backfill of everything (`refresh: true` re-fetches stored days) |
 | `garmin_auth_url` | Link to reconnect Garmin |
-| `garmin_workouts` | Workout library + upcoming calendar entries (with ids) |
-| `garmin_create_strength_workout` | Build a strength workout (sets × reps @ kg, rest); optional schedule date / send to watch |
-| `garmin_create_run_workout` | Build a structured run (warmup/intervals/recovery/cooldown, pace or HR-zone targets, repeats) |
+| `garmin_workouts` | Workout library (any sport) + upcoming calendar entries (with ids) |
+| `garmin_workout_detail` | Read one workout step by step — exercises, loads, durations, targets, repeats, notes |
+| `garmin_create_strength_workout` | Build a strength workout (sets × reps or timed sets, @ kg, rest); optional schedule date / send to watch; `workout_id` replaces one in place |
+| `garmin_create_workout` | Build a structured workout for any sport — bike, run, walk, hike, pool swim, cardio machines (rower, elliptical, stairs), HIIT, yoga, pilates, mobility; HR zone/bpm, pace, speed, power or cadence targets; repeats; `workout_id` replaces one in place |
+| `garmin_create_run_workout` | Same as `garmin_create_workout` with sport "running" |
 | `garmin_schedule_workout` | Put a library workout on a calendar date |
 | `garmin_remove_workout` | Unschedule one date, or delete from the library |
 | `garmin_weigh_ins` | Weigh-ins (weight, BMI, body fat) |
