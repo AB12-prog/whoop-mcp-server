@@ -71,10 +71,15 @@ interface BridgeOptions {
 	loadTokens: () => string | null;
 }
 
+const RESTORE_ATTEMPTS = 3;
+const RESTORE_COOLDOWN_MS = 5 * 60_000;
+
 export class GarminBridge {
 	private proc: ChildProcess | null = null;
 	private port: number | null = null;
 	private starting: Promise<void> | null = null;
+	private restoring: Promise<boolean> | null = null;
+	private lastRestoreAt = 0;
 	private readonly secret = randomBytes(32).toString('hex');
 
 	constructor(private readonly opts: BridgeOptions) {}
@@ -86,7 +91,17 @@ export class GarminBridge {
 
 	async call<T = Record<string, unknown>>(path: string, body: unknown = {}, timeoutMs = 90_000): Promise<T> {
 		await this.ensure();
-		return this.request<T>(path, body, timeoutMs);
+		try {
+			return await this.request<T>(path, body, timeoutMs);
+		} catch (err) {
+			// The bridge lost its in-memory session (sidecar restart, or a boot-time
+			// restore that hit a transient Garmin error) while valid tokens are
+			// still saved. Restore once and retry rather than demanding a re-sign-in.
+			if (err instanceof GarminBridgeError && err.code === 'not_authenticated' && (await this.restore())) {
+				return this.request<T>(path, body, timeoutMs);
+			}
+			throw err;
+		}
 	}
 
 	stop(): void {
@@ -146,15 +161,43 @@ export class GarminBridge {
 		this.port = port;
 
 		// Restore the saved Garmin session so the bridge is usable straight away.
-		const tokens = this.opts.loadTokens();
-		if (tokens) {
-			try {
-				await this.request('/session/load', { tokens }, 60_000);
-				console.log('[garmin] session restored');
-			} catch (err) {
-				console.error('[garmin] saved session could not be restored — sign in again at /reauth:', err instanceof Error ? err.message : err);
+		this.lastRestoreAt = 0;
+		await this.restore();
+	}
+
+	/**
+	 * Load the saved token set into the bridge. Retries transient failures a
+	 * few times; at most one attempt cycle per cooldown so a genuinely expired
+	 * session doesn't hammer Garmin's login endpoints.
+	 */
+	private restore(): Promise<boolean> {
+		if (this.restoring) return this.restoring;
+		if (Date.now() - this.lastRestoreAt < RESTORE_COOLDOWN_MS) return Promise.resolve(false);
+		this.lastRestoreAt = Date.now();
+		this.restoring = (async () => {
+			const tokens = this.opts.loadTokens();
+			if (!tokens) return false;
+			for (let attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt++) {
+				try {
+					await this.request('/session/load', { tokens }, 60_000);
+					console.log(`[garmin] session restored${attempt > 1 ? ` (attempt ${attempt})` : ''}`);
+					return true;
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					// A real rejection won't fix itself: stop and ask for a sign-in.
+					if (err instanceof GarminBridgeError && err.code === 'auth') {
+						console.error('[garmin] saved session rejected by Garmin — sign in again at /reauth:', msg);
+						return false;
+					}
+					console.error(`[garmin] session restore attempt ${attempt}/${RESTORE_ATTEMPTS} failed:`, msg);
+					if (attempt < RESTORE_ATTEMPTS) await sleep(attempt * 10_000);
+				}
 			}
-		}
+			return false;
+		})().finally(() => {
+			this.restoring = null;
+		});
+		return this.restoring;
 	}
 
 	private async request<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
